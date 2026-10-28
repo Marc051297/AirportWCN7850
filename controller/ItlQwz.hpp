@@ -45,6 +45,7 @@ public:
 	int getRxRateMcs() override;
 	int getRxRateNss() override;
 	int getRxRateSgi() override;
+	int8_t getBSSRssi(int8_t raw) override;
 
 	/* ItlDriverController */
 	void clearScanningFlags() override;

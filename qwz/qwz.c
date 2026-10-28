@@ -1167,6 +1167,197 @@ qwz_setkey_clear(struct qwz_softc *sc)
 	sc->setkey_cur = sc->setkey_tail = sc->setkey_nkeys = 0;
 }
 
+/*
+ * RX observation: the smoothed BSS RSSI macOS is told, and the passive AWDL
+ * receive probe. Both only read frames on their way to net80211; neither
+ * drops, modifies or consumes anything.
+ */
+#define QWZ_MACFMT	"%02x:%02x:%02x:%02x:%02x:%02x"
+#define QWZ_MACARG(a)	(a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
+
+/*
+ * Smoothed RSSI of the associated BSS. ni_rssi stays the raw last-frame value
+ * net80211 has always used (roaming and background-scan decisions read it);
+ * this is a separate exponential moving average for what macOS reports
+ * (getRSSI, the LQM snapshot, the associated BSS's scan entry; see
+ * ItlQwz::getBSSRssi):
+ *
+ *	avg += (sample - avg) / 8
+ *
+ * kept in 1/16 dBm, so a difference of a few dB still moves the average
+ * instead of truncating to zero. Only frames the associated AP transmitted
+ * count (beacons and other management frames: qwz_mgmt_rx_event; data frames:
+ * qwz_dp_rx_deliver_msdu), at most one sample every 50 ms so that a burst of
+ * A-MPDU subframes does not outweigh the quiet periods. The first sample of
+ * an association seeds the average, and qwz_newstate_task resets it whenever
+ * the state enters or leaves RUN. TX-ACK RSSI is not a sample.
+ */
+#define QWZ_BSS_RSSI_MIN_GAP_NS	(50ULL * 1000000ULL)
+
+static void
+qwz_bss_rssi_reset(struct qwz_softc *sc)
+{
+	sc->sc_bss_rssi_valid = 0;
+	sc->sc_bss_rssi_nsamples = 0;
+}
+
+static void
+qwz_bss_rssi_sample(struct qwz_softc *sc, const uint8_t *ta, int rssi_dbm)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	static unsigned int seed_log;
+	uint64_t now;
+	int x;
+
+	if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+	    !IEEE80211_ADDR_EQ(ta, ic->ic_bss->ni_bssid))
+		return;
+	/* A dBm value is negative: 0 means "no RSSI", anything above is garbage. */
+	if (rssi_dbm >= 0 || rssi_dbm < -127)
+		return;
+	x = rssi_dbm * 16;
+	now = getnsecuptime();
+	if (!sc->sc_bss_rssi_valid ||
+	    !IEEE80211_ADDR_EQ(sc->sc_bss_rssi_bssid, ic->ic_bss->ni_bssid)) {
+		IEEE80211_ADDR_COPY(sc->sc_bss_rssi_bssid, ic->ic_bss->ni_bssid);
+		sc->sc_bss_rssi_fx = x;
+		sc->sc_bss_rssi_nsamples = 0;
+		sc->sc_bss_rssi_valid = 1;
+		if (qwz_log_ratelimit(&seed_log, 16, 64))
+			qwz_log("qwz: rssi ema seeded bssid " QWZ_MACFMT
+			    " rssi %d dBm (seed #%u)\n",
+			    QWZ_MACARG(ic->ic_bss->ni_bssid), rssi_dbm, seed_log);
+	} else if (now - sc->sc_bss_rssi_ns >= QWZ_BSS_RSSI_MIN_GAP_NS)
+		sc->sc_bss_rssi_fx += (x - sc->sc_bss_rssi_fx) / 8;
+	else
+		return;
+	sc->sc_bss_rssi_ns = now;
+	sc->sc_bss_rssi_nsamples++;
+}
+
+/* The AWDL BSSID: Apple's fixed, locally defined BSSID for every AWDL peer. */
+static const uint8_t qwz_awdl_bssid[IEEE80211_ADDR_LEN] =
+    { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+
+/*
+ * Once a minute: the probe's totals and the RSSI views, in one ring line. Zero
+ * AWDL counters next to non-zero "seen" counters mean the probe ran and the
+ * firmware delivered nothing AWDL to the host.
+ */
+static void
+qwz_rx_probe_summary(struct qwz_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint64_t now = getnsecuptime();
+	int raw = 0;
+
+	if (sc->sc_probe_summary_ns == 0) {
+		sc->sc_probe_summary_ns = now;
+		return;
+	}
+	if (now - sc->sc_probe_summary_ns < 60ULL * 1000000000ULL)
+		return;
+	sc->sc_probe_summary_ns = now;
+	if (ic->ic_bss != NULL)
+		raw = (int8_t)ic->ic_bss->ni_rssi;
+	qwz_log("qwz: rx-probe summary: mgmt_seen %u data_seen %u awdl_action %u "
+	    "awdl_mgmt_a3 %u awdl_data_a3 %u | rssi ema %d (n %u, valid %d) "
+	    "raw_ni %d last_rx %d last_tx_ack %d\n",
+	    sc->sc_probe_mgmt_seen, sc->sc_probe_data_seen,
+	    sc->sc_awdl_mgmt_action, sc->sc_awdl_mgmt_bssid,
+	    sc->sc_awdl_data_bssid,
+	    sc->sc_bss_rssi_valid ? (sc->sc_bss_rssi_fx >= 0 ?
+	    (sc->sc_bss_rssi_fx + 8) / 16 : -((-sc->sc_bss_rssi_fx + 8) / 16)) : 0,
+	    sc->sc_bss_rssi_nsamples, sc->sc_bss_rssi_valid, raw,
+	    sc->sc_rx_rssi, sc->sc_tx_ack_rssi);
+}
+
+/*
+ * A management frame about to go to net80211: count Apple vendor-specific
+ * action frames (category 127, OUI 00:17:f2: AWDL) and management frames whose
+ * A3 is the AWDL BSSID, and feed the smoothed RSSI when the AP sent it.
+ */
+static void
+qwz_rx_observe_mgmt(struct qwz_softc *sc, struct mbuf *m, int rssi,
+    uint32_t freq, uint32_t chan)
+{
+	const struct ieee80211_frame *wh = mtod(m, const struct ieee80211_frame *);
+	const uint8_t *f = (const uint8_t *)wh;
+	size_t len = (size_t)M_LEN(m);
+	int action, a3, subtype;
+
+	if (len < sizeof(*wh) ||
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_MGT)
+		return;
+	sc->sc_probe_mgmt_seen++;
+	qwz_bss_rssi_sample(sc, wh->i_addr2, rssi);
+
+	subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+	action = (subtype == IEEE80211_FC0_SUBTYPE_ACTION ||
+	    subtype == IEEE80211_FC0_SUBTYPE_ACTION_NOACK) &&
+	    len >= sizeof(*wh) + 4 && f[24] == IEEE80211_CATEG_VENDOR &&
+	    f[25] == 0x00 && f[26] == 0x17 && f[27] == 0xf2;
+	a3 = IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid);
+	if (action)
+		sc->sc_awdl_mgmt_action++;
+	if (a3)
+		sc->sc_awdl_mgmt_bssid++;
+	if ((action || a3) &&
+	    qwz_log_ratelimit(&sc->sc_awdl_log_mgmt, 24, 64)) {
+		/* After the OUI: OUI type (8 = AWDL), version, subtype (0 PSF, 3 MIF). */
+		int have = len >= sizeof(*wh) + 7;
+
+		qwz_log("qwz: awdl-probe mgmt #%u ta " QWZ_MACFMT " a1 " QWZ_MACFMT
+		    " a3 " QWZ_MACFMT " rssi %d freq %u ch %u fc %02x%02x %s "
+		    "oui_type %02x version %02x subtype %02x | totals action %u "
+		    "mgmt_a3 %u data_a3 %u\n",
+		    sc->sc_awdl_log_mgmt, QWZ_MACARG(wh->i_addr2),
+		    QWZ_MACARG(wh->i_addr1), QWZ_MACARG(wh->i_addr3), rssi,
+		    freq, chan, wh->i_fc[0], wh->i_fc[1],
+		    action ? "awdl-action" : "awdl-bssid",
+		    have ? f[28] : 0xff, have ? f[29] : 0xff, have ? f[30] : 0xff,
+		    sc->sc_awdl_mgmt_action, sc->sc_awdl_mgmt_bssid,
+		    sc->sc_awdl_data_bssid);
+	}
+	qwz_rx_probe_summary(sc);
+}
+
+/*
+ * A data MSDU about to go to net80211 (native-wifi decap: the 802.11 header is
+ * the hardware's). Counts frames whose A3 is the AWDL BSSID, and feeds the
+ * smoothed RSSI for frames the AP sent us (From DS, A2 = BSSID) whose RX
+ * descriptor carried a fresh RSSI rather than the carried-over last value.
+ */
+static void
+qwz_rx_observe_data(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
+{
+	const struct ieee80211_frame *wh;
+	int fresh = sc->sc_rx_rssi_fresh;
+
+	sc->sc_rx_rssi_fresh = 0;
+	if (msdu->m == NULL || (size_t)M_LEN(msdu->m) < sizeof(*wh))
+		return;
+	wh = mtod(msdu->m, const struct ieee80211_frame *);
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA)
+		return;
+	sc->sc_probe_data_seen++;
+	if (fresh && (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) ==
+	    IEEE80211_FC1_DIR_FROMDS)
+		qwz_bss_rssi_sample(sc, wh->i_addr2, msdu->rxi.rxi_rssi);
+	if (IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid)) {
+		sc->sc_awdl_data_bssid++;
+		if (qwz_log_ratelimit(&sc->sc_awdl_log_data, 24, 64))
+			qwz_log("qwz: awdl-probe data #%u ta " QWZ_MACFMT " a1 "
+			    QWZ_MACFMT " a3 " QWZ_MACFMT " rssi %d ch %d fc "
+			    "%02x%02x | totals action %u mgmt_a3 %u data_a3 %u\n",
+			    sc->sc_awdl_log_data, QWZ_MACARG(wh->i_addr2),
+			    QWZ_MACARG(wh->i_addr1), QWZ_MACARG(wh->i_addr3),
+			    msdu->rxi.rxi_rssi, msdu->rxi.rxi_chan,
+			    wh->i_fc[0], wh->i_fc[1], sc->sc_awdl_mgmt_action,
+			    sc->sc_awdl_mgmt_bssid, sc->sc_awdl_data_bssid);
+	}
+}
+
 int
 qwz_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 {
@@ -1220,6 +1411,11 @@ qwz_newstate_task(void *arg)
 		splx(s);
 		return;
 	}
+
+	/* A new association starts a new smoothed-RSSI average. */
+	if (nstate != ostate &&
+	    (nstate == IEEE80211_S_RUN || ostate == IEEE80211_S_RUN))
+		qwz_bss_rssi_reset(sc);
 
 	if (ostate == IEEE80211_S_SCAN) {
 		if (nstate == ostate) {
@@ -12104,6 +12300,8 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 #endif
 
 	wh = mtod(m, struct ieee80211_frame *);
+	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
+	qwz_rx_observe_mgmt(sc, m, rxi.rxi_rssi, rx_ev.chan_freq, rx_ev.channel);
 	ni = ieee80211_find_rxnode(ic, wh);
 #if 0
 	/* In case of PMF, FW delivers decrypted frames with Protected Bit set.
@@ -14817,7 +15015,14 @@ qwz_dp_tx_complete_msdu(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
 		if (!isset(sc->wmi.svc_map,
 		    WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT))
 			rssi_dbm += ATH12K_DEFAULT_NOISE_FLOOR;
-		tx_data->ni->ni_rssi = rssi_dbm;
+		/*
+		 * Not ni_rssi: the RSSI of an ACK is measured on a different
+		 * frame class from the beacons and data that ni_rssi (and the
+		 * smoothed BSS RSSI macOS reads) come from, and writing it
+		 * there made the reported value alternate between sources.
+		 * Kept for the rx-probe summary line only.
+		 */
+		sc->sc_tx_ack_rssi = rssi_dbm;
 	}
 
 	ieee80211_release_node(ic, tx_data->ni);
@@ -15460,6 +15665,7 @@ qwz_dp_rx_h_rate(struct qwz_softc *sc, struct hal_rx_desc *rx_desc,
 	uint32_t kbps;
 
 	rssi = sc->hal_rx_ops->rx_desc_get_msdu_rssi(rx_desc);
+	sc->sc_rx_rssi_fresh = (rssi != 0);	/* qwz_rx_observe_data: a real sample? */
 	if (rssi != 0) {
 		rssi_dbm = (int8_t)rssi;
 		if (!isset(sc->wmi.svc_map,
@@ -16043,6 +16249,8 @@ qwz_dp_rx_deliver_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
 	struct ieee80211_node *ni;
 
 	wh = mtod(msdu->m, struct ieee80211_frame *);
+	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
+	qwz_rx_observe_data(sc, msdu);
 	ni = ieee80211_find_rxnode(ic, wh);
 
 #if NBPFILTER > 0

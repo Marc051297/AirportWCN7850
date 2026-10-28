@@ -351,6 +351,9 @@ getAUTH_TYPE(struct apple80211_authtype_data *ad)
 IOReturn AirportItlwmSkywalkInterface::
 setAUTH_TYPE(struct apple80211_authtype_data *ad)
 {
+    static unsigned int calls;
+    if (qwz_log_ratelimit(&calls, 24, 64))
+        qwz_log("airport: setAUTH_TYPE #%u: lower %u upper 0x%x\n", calls, ad->authtype_lower, ad->authtype_upper);
     current_authtype_lower = ad->authtype_lower;
     current_authtype_upper = ad->authtype_upper;
     return kIOReturnSuccess;
@@ -360,7 +363,16 @@ IOReturn AirportItlwmSkywalkInterface::
 setCIPHER_KEY(struct apple80211_key *key)
 {
 #ifdef AIRPORT_WCL
-    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(8), key);
+    IOReturn result = _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(8), key);
+    static unsigned int calls;
+    if (key && qwz_log_ratelimit(&calls, 24, 64))
+        qwz_log("airport: setCIPHER_KEY #%u: cipher %u%s len %u flags 0x%x index %u rsc_len %u "
+                "validCipherKey %d -> 0x%x\n", calls, key->key_cipher_type,
+                key->key_cipher_type == 10 ? " (PWD)" : key->key_cipher_type == 6 ? " (PMK)" : "",
+                key->key_len, key->key_flags, key->key_index, key->key_rsc_len,
+                AirportWCL::validCipherKey(key->key_cipher_type, key->key_len, key->key_flags,
+                                           key->key_index, key->key_rsc_len), unsigned(result));
+    return result;
 #else
 
     XYLog("%s\n", __FUNCTION__);
@@ -797,6 +809,28 @@ getBSSID(struct apple80211_bssid_data *bd)
     return 6;
 }
 
+/*
+ * The RSSI macOS is told for `node`. For the BSS we are associated with this
+ * is the driver's smoothed value (ItlDriverInfo::getBSSRssi: an average of the
+ * frames the AP sent, reset on every association); every other node, scan
+ * results of other networks included, keeps its own last-frame RSSI. net80211
+ * keeps using ni_rssi as before.
+ */
+static int8_t smoothedNodeRssi(ItlHalService *hal, const struct ieee80211_node *node)
+{
+    int8_t raw = (int8_t)node->ni_rssi;	/* qwz stores dBm, not iwm's offset from -100 */
+    struct ieee80211com *ic = hal->get80211Controller();
+    if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+        !IEEE80211_ADDR_EQ(node->ni_bssid, ic->ic_bss->ni_bssid))
+        return raw;
+    return hal->getDriverInfo()->getBSSRssi(raw);
+}
+
+int8_t AirportItlwmSkywalkInterface::rssiForNode(const struct ieee80211_node *node)
+{
+    return smoothedNodeRssi(fHalService, node);
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 getRSSI(struct apple80211_rssi_data *rd)
 {
@@ -808,7 +842,7 @@ getRSSI(struct apple80211_rssi_data *rd)
         rd->rssi[0] = rd->aggregate_rssi
         = rd->rssi_ext[0]
         = rd->aggregate_rssi_ext
-        = (int8_t)ic->ic_bss->ni_rssi;	/* qwz stores dBm, not iwm's offset from -100 */
+        = rssiForNode(ic->ic_bss);	/* dBm (qwz stores dBm, not iwm's offset from -100), smoothed */
         return kIOReturnSuccess;
     }
     return 6;
@@ -925,6 +959,25 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
 
     if (!ad)
         return kIOReturnError;
+
+#ifdef AIRPORT_WCL
+    {
+        static unsigned int calls;
+        if (qwz_log_ratelimit(&calls, 24, 64)) {
+            char rsn[96];
+            size_t rsnLen = ad->ad_rsn_ie_len <= APPLE80211_MAX_RSN_IE_LEN ? ad->ad_rsn_ie_len : APPLE80211_MAX_RSN_IE_LEN;
+            AirportWCL::formatRsnSummary(ad->ad_rsn_ie, rsnLen, rsn, sizeof(rsn));
+            qwz_log("airport: setASSOCIATE #%u: mode %d auth lower %u upper 0x%x ssid_len %u | key len %u "
+                    "cipher %u%s flags 0x%x index %u printable %d | rsn_ie len %u %s | ad_flags 0x%x | state %d\n",
+                    calls, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_ssid_len,
+                    ad->ad_key.key_len, ad->ad_key.key_cipher_type,
+                    ad->ad_key.key_cipher_type == 10 ? " (PWD)" : ad->ad_key.key_cipher_type == 6 ? " (PMK)" : "",
+                    ad->ad_key.key_flags, ad->ad_key.key_index,
+                    ad->ad_key.key_len <= APPLE80211_KEY_BUFF_LEN && AirportWCL::printableKey(ad->ad_key.key, ad->ad_key.key_len),
+                    ad->ad_rsn_ie_len, rsn, ad->ad_flags, int(ic->ic_state));
+        }
+    }
+#endif
     
     if (ic->ic_state < IEEE80211_S_SCAN)
         return kIOReturnSuccess;
@@ -1080,7 +1133,7 @@ getLINK_CHANGED_EVENT_DATA(struct apple80211_link_changed_event_data *ed)
         ed->voluntary = disassocIsVoluntary;
         ed->reason = APPLE80211_LINK_DOWN_REASON_DEAUTH;
     } else
-        ed->rssi = (int8_t)ic->ic_bss->ni_rssi;	/* dBm */
+        ed->rssi = rssiForNode(ic->ic_bss);	/* dBm */
     XYLog("Link %s, reason: %d, voluntary: %d\n", ed->isLinkDown ? "down" : "up", ed->reason, ed->voluntary);
     return kIOReturnSuccess;
 }
@@ -1142,7 +1195,7 @@ static int convertNodeToScanResult(ItlHalService *fHalService, struct ieee80211_
     result->asr_channel.channel = ieee80211_chan2ieee(fHalService->get80211Controller(), fNextNodeToSend->ni_chan);
     result->asr_channel.flags = ieeeChanFlag2appleScanFlagVentura(fNextNodeToSend->ni_chan->ic_flags);
     result->asr_noise = fHalService->getDriverInfo()->getBSSNoise();  /* already dBm */
-    result->asr_rssi = (int8_t)fNextNodeToSend->ni_rssi;	/* dBm */
+    result->asr_rssi = smoothedNodeRssi(fHalService, fNextNodeToSend);	/* dBm; smoothed only for the connected BSS */
     memcpy(result->asr_bssid, fNextNodeToSend->ni_bssid, IEEE80211_ADDR_LEN);
     result->asr_ssid_len = fNextNodeToSend->ni_esslen;
     if (result->asr_ssid_len != 0)

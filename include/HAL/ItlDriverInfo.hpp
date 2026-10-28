@@ -40,6 +40,14 @@ public:
     virtual int getRxRateMcs() { return -1; }
     virtual int getRxRateNss() { return 0; }
     virtual int getRxRateSgi() { return -1; }	/* 1 short GI, 0 long, -1 unknown */
+
+    /*
+     * Native Wi-Fi: RSSI (dBm) of the associated BSS as macOS should see it.
+     * `raw` is the node's last-frame value; a driver that smooths it returns
+     * the smoothed one, and anything else (not associated, no sample yet)
+     * returns `raw` unchanged.
+     */
+    virtual int8_t getBSSRssi(int8_t raw) { return raw; }
 };
 
 #endif /* ItlDriverInfo_h */

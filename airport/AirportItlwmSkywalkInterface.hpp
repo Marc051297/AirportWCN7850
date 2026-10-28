@@ -118,6 +118,8 @@ public:
     void associateSSID(uint8_t *ssid, uint32_t ssid_len, const struct ether_addr &bssid, uint32_t authtype_lower, uint32_t authtype_upper, uint8_t *key, uint32_t key_len, int key_index);
     void setPTK(const u_int8_t *key, size_t key_len);
     void setGTK(const u_int8_t *key, size_t key_len, u_int8_t kid, u_int8_t *rsc);
+    /* RSSI (dBm) macOS is told for `node`: smoothed for the BSS we are in, the node's own otherwise. */
+    int8_t rssiForNode(const struct ieee80211_node *node);
     
 public:
     virtual IOReturn getSSID(apple80211_ssid_data *) AIRPORT_SKYWALK_OVERRIDE;

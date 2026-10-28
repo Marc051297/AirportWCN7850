@@ -15,6 +15,7 @@
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
 #include <crypto/sha1.h>
+#include "qwz_log.h"
 
 extern IOCommandGate *_fCommandGate;
 
@@ -288,7 +289,7 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->ssidLength = node->ni_esslen;
     memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
     memcpy(metadata->bssid, node->ni_bssid, 6);
-    metadata->rssi = (int8_t)node->ni_rssi;  /* qwz stores dBm directly as uint8; cast to signed */
+    metadata->rssi = rssiForNode(node);  /* dBm (qwz stores it as uint8, read as signed); smoothed only for the connected BSS */
     metadata->noise = fHalService->getDriverInfo()->getBSSNoise();  /* -95 dBm */
     metadata->snr = metadata->rssi - metadata->noise;  /* e.g. -48 - (-95) = 47 dB */
     metadata->interval = node->ni_intval;
@@ -359,7 +360,15 @@ IOReturn AirportItlwmSkywalkInterface::accessWCLRSN(apple80211_rsn_ie_data *data
     if (!data) return kIOReturnBadArgument;
     auto ic = fHalService->get80211Controller();
     if (write) {
-        if (!AirportWCL::validRSNOverride(data->ie, data->len))
+        static unsigned int rsnSets;
+        bool valid = AirportWCL::validRSNOverride(data->ie, data->len);
+        if (qwz_log_ratelimit(&rsnSets, 24, 64)) {
+            char rsn[96];
+            AirportWCL::formatRsnSummary(data->ie, data->len <= sizeof(data->ie) ? data->len : sizeof(data->ie),
+                                         rsn, sizeof(rsn));
+            qwz_log("airport: setRSN_IE #%u: len %u valid %d %s\n", rsnSets, unsigned(data->len), valid, rsn);
+        }
+        if (!valid)
             return kIOReturnBadArgument;
         // net80211 constructs negotiated IEs for its own key handshake.
         return kIOReturnUnsupported;
@@ -376,10 +385,147 @@ IOReturn AirportItlwmSkywalkInterface::accessWCLRSN(apple80211_rsn_ie_data *data
     return kIOReturnSuccess;
 }
 
+// ---- Join diagnostics (WCL.hpp): lengths, types and flags into the qwz_log ring. ----
+// Nothing here ever prints key bytes, passwords, PMKs or a hash of them.
+
+bool AirportWCL::printableKey(const uint8_t *key, size_t length)
+{
+    if (!key || !length)
+        return false;
+    for (size_t i = 0; i < length; ++i)
+        if (key[i] < 0x20 || key[i] > 0x7e)
+            return false;
+    return true;
+}
+
+size_t AirportWCL::formatRsnSummary(const uint8_t *ie, size_t length, char *out, size_t outSize)
+{
+    if (!out || outSize < 16)
+        return 0;
+    out[0] = '\0';
+    if (!ie || length < 2) {
+        snprintf(out, outSize, "none");
+        return 0;
+    }
+    size_t total = size_t(ie[1]) + 2;
+    if (total > length)
+        total = length;
+    size_t p;
+    if (ie[0] == 48) {
+        p = 2;
+    } else if (ie[0] == 221 && total >= 6 && ie[2] == 0x00 && ie[3] == 0x50 &&
+               ie[4] == 0xf2 && ie[5] == 1) {
+        p = 6;
+    } else {
+        snprintf(out, outSize, "ie id %u is not RSN/WPA", ie[0]);
+        return 0;
+    }
+    // version(2) group cipher(4) pairwise count(2) pairwise suites, AKM count(2) AKM suites, caps(2)
+    if (p + 8 > total) {
+        snprintf(out, outSize, "truncated");
+        return 0;
+    }
+    p += 2 + 4;
+    size_t pairwise = read16(ie + p);
+    p += 2;
+    if (pairwise > (total - p) / 4) {
+        snprintf(out, outSize, "truncated");
+        return 0;
+    }
+    p += pairwise * 4;
+    if (p + 2 > total) {
+        snprintf(out, outSize, "truncated");
+        return 0;
+    }
+    size_t akms = read16(ie + p);
+    p += 2;
+    size_t pos = size_t(snprintf(out, outSize, "akm="));
+    size_t found = 0;
+    for (size_t i = 0; i < akms && p + 4 <= total; ++i, p += 4) {
+        int n = snprintf(out + pos, outSize - pos, "%s%02x%02x%02x:%u",
+                         found ? "," : "", ie[p], ie[p + 1], ie[p + 2], ie[p + 3]);
+        if (n < 0 || size_t(n) >= outSize - pos)
+            break;
+        pos += size_t(n);
+        ++found;
+    }
+    if (!found && pos < outSize)
+        pos += size_t(snprintf(out + pos, outSize - pos, "-"));
+    if (found == akms && p + 2 <= total && pos < outSize)
+        snprintf(out + pos, outSize - pos, " caps=0x%04x", read16(ie + p));
+    else if (found != akms && pos < outSize)
+        snprintf(out + pos, outSize - pos, " (%u of %u parsed)", unsigned(found), unsigned(akms));
+    return found;
+}
+
+void AirportWCL::logJoinRaw(const void *buffer, size_t length)
+{
+    static unsigned int calls;
+    if (!qwz_log_ratelimit(&calls, 24, 64))
+        return;
+    if (!buffer || length < 0x1e0) {
+        qwz_log("airport: WCL join raw #%u: buffer %p length 0x%lx too short to read\n",
+                calls, buffer, (unsigned long)length);
+        return;
+    }
+    const uint8_t *p = static_cast<const uint8_t *>(buffer);
+    uint32_t lower = read32(p + 0x10), upper = read32(p + 0x14);
+    uint32_t ssidLength = read32(p + 0x1c);
+    uint32_t keyLength = read32(p + 0x44), keyCipher = read32(p + 0x48);
+    uint16_t keyFlags = read16(p + 0x4c), keyIndex = read16(p + 0x4e);
+    uint16_t rsnLength = read16(p + 0xd4);
+    uint32_t count = length >= 0x218 ? read32(p + 0x214) : 0;
+    // Same checks, same order as decodeJoin below: which one a rejected join trips.
+    const char *verdict = "accepted";
+    if (length < 0x218)
+        verdict = "REJECT buffer < 0x218";
+    else if (!count || count > 10)
+        verdict = "REJECT candidate count";
+    else if (!ssidLength || ssidLength > 32)
+        verdict = "REJECT ssid length";
+    else if (keyLength > 32)
+        verdict = "REJECT keyLength > 32";
+    else if (rsnLength > 257)
+        verdict = "REJECT rsnLength > 257";
+    else if (length < 0x218 + size_t(count) * 18)
+        verdict = "REJECT buffer < candidates";
+    else if (p[0x21c] & 1)
+        verdict = "REJECT bssid multicast";
+    else if (!(p[0x21c] | p[0x21d] | p[0x21e] | p[0x21f] | p[0x220] | p[0x221]))
+        verdict = "REJECT bssid zero";
+    // isPassphrase() as the join code evaluates it (it is false above 32 bytes);
+    // `printable` says whether the whole key, up to the 64 bytes the request can
+    // carry, would pass its character test.
+    JoinRequest tmp = {};
+    tmp.upperAuth = upper;
+    tmp.keyLength = keyLength;
+    tmp.keyCipher = keyCipher;
+    if (keyLength <= sizeof(tmp.key))
+        memcpy(tmp.key, p + 0x50, keyLength);
+    bool passphrase = isPassphrase(tmp);
+    explicit_bzero(&tmp, sizeof(tmp));
+    bool printable = keyLength <= 64 && printableKey(p + 0x50, keyLength);
+    char rsn[96];
+    size_t rsnShown = rsnLength <= 257 ? rsnLength : 257;
+    if (0xd6 + rsnShown > length)
+        rsnShown = length - 0xd6;
+    formatRsnSummary(p + 0xd6, rsnShown, rsn, sizeof(rsn));
+    qwz_log("airport: WCL join raw #%u: auth lower %u upper 0x%x ssid_len %u | key len %u "
+            "cipher %u%s flags 0x%x index %u isPassphrase %d printable %d | rsn_ie len %u %s | "
+            "pmk_len? @1d8 %u @1dc %u | candidates %u | decodeJoin: %s\n",
+            calls, lower, upper, ssidLength, keyLength, keyCipher,
+            keyCipher == 10 ? " (PWD)" : keyCipher == 6 ? " (PMK)" : "",
+            keyFlags, keyIndex, passphrase, printable, rsnLength, rsn,
+            read32(p + 0x1d8), read32(p + 0x1dc), count, verdict);
+}
+
 IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *request)
 {
     AirportWCL::JoinRequest join;
     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+        static unsigned int rejected;
+        if (qwz_log_ratelimit(&rejected, 24, 64))
+            qwz_log("airport: WCL join #%u: decodeJoin rejected the request -> kIOReturnBadArgument (reason: see the 'join raw' line just above)\n", rejected);
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);
@@ -396,6 +542,20 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
+    {
+        static unsigned int started;
+        if (qwz_log_ratelimit(&started, 24, 64)) {
+            char rsn[96];
+            AirportWCL::formatRsnSummary(join.rsn, join.rsnLength, rsn, sizeof(rsn));
+            qwz_log("airport: WCL join start #%u: ssid_len %u bssid %s chanspec 0x%x auth lower %u "
+                    "upper 0x%x -> %s (supported %d) | key len %u cipher %u isPassphrase %d | "
+                    "rsn_ie len %u %s | state %d scanPending %d joinPending %d\n",
+                    started, join.ssidLength, ether_sprintf(join.bssid), join.channelSpec,
+                    join.lowerAuth, join.upperAuth, AirportWCL::legacyAuthName(auth), supported,
+                    join.keyLength, join.keyCipher, AirportWCL::isPassphrase(join),
+                    join.rsnLength, rsn, int(ic->ic_state), scanPending, joinPending);
+        }
+    }
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
@@ -409,6 +569,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         return kIOReturnSuccess;
     }
     if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+        static unsigned int refused;
+        if (qwz_log_ratelimit(&refused, 24, 64))
+            qwz_log("airport: WCL join refused #%u: %s (supported %d running %d joinPending %d scanPending %d)\n",
+                    refused, !supported ? "unsupported auth/key combination -> kIOReturnUnsupported" :
+                    "radio not running or another join/scan pending -> kIOReturnBusy",
+                    supported, !!(ic->ic_if.if_flags & IFF_RUNNING), joinPending, scanPending);
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
@@ -714,7 +880,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                     AirportWCL::LqmBeaconUpdate update;
                     if (AirportWCL::makeBeaconUpdate(
                             wclLqmBeacons - wclLqmReportedBeacons,
-                            (int8_t)ic->ic_bss->ni_rssi,	/* dBm */
+                            rssiForNode(ic->ic_bss),	/* dBm, smoothed */
                             fHalService->getDriverInfo()->getBSSNoise(), update)) {
                         instance->postMessage(this, AirportWCL::LqmUpdate,
                             &update, sizeof(update), true);

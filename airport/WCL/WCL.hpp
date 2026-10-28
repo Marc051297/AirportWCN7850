@@ -569,7 +569,18 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     return LegacyAuth::Invalid;
 }
 
+// Join diagnostics (WCL.cpp). They only write to the qwz_log ring: lengths,
+// types and flags, never key bytes, passwords or PMKs.
+// logJoinRaw: the raw fields of a WCL join request, before decodeJoin judges it.
+void logJoinRaw(const void *buffer, size_t length);
+// formatRsnSummary: "akm=000fac:8,000fac:2 caps=0x00c0" for an RSN or WPA IE (as
+// much as parses); returns the number of AKM suites found.
+size_t formatRsnSummary(const uint8_t *ie, size_t length, char *out, size_t outSize);
+// printableKey: every byte of a key buffer is printable ASCII (a passphrase, not a PMK).
+bool printableKey(const uint8_t *key, size_t length);
+
 inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
+    logJoinRaw(buffer, length);	// diagnostics only: before any early rejection below
     if (!buffer || length < 0x218)
         return false;
     const uint8_t *p = static_cast<const uint8_t *>(buffer);

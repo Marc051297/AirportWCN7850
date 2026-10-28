@@ -366,6 +366,28 @@ ItlQwz::getRxRateSgi()
 	return (sc && sc->sc_rx_rate_kbps != 0) ? sc->sc_rx_rate_sgi : -1;
 }
 
+/*
+ * The smoothed RSSI of the associated BSS (qwz_bss_rssi_sample in qwz.c), in
+ * dBm. Falls back to the caller's raw value when the average does not belong
+ * to the BSS we are in now, so a stale value is never reported.
+ */
+int8_t
+ItlQwz::getBSSRssi(int8_t raw)
+{
+	struct ieee80211com *ic = sc ? &sc->sc_ic : NULL;
+	int x, dbm;
+
+	if (ic == NULL || ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+	    !sc->sc_bss_rssi_valid ||
+	    !IEEE80211_ADDR_EQ(sc->sc_bss_rssi_bssid, ic->ic_bss->ni_bssid))
+		return raw;
+	x = sc->sc_bss_rssi_fx;		/* 1/16 dBm */
+	dbm = x >= 0 ? (x + 8) / 16 : -((-x + 8) / 16);
+	if (dbm >= 0 || dbm < -127)
+		return raw;
+	return (int8_t)dbm;
+}
+
 const char *
 ItlQwz::getFirmwareName()
 {

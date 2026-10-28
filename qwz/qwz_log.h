@@ -32,6 +32,19 @@ void	qwz_stage_reset(void);
 void	qwz_log_publish(void);
 
 /*
+ * Rate limit for a log site. *count is the site's running total (it always
+ * counts); returns non-zero for the first `first` calls and then for every
+ * `every`th one, so a site that fires in a loop cannot flood the ring.
+ */
+static inline int
+qwz_log_ratelimit(unsigned int *count, unsigned int first, unsigned int every)
+{
+	unsigned int n = __atomic_add_fetch(count, 1u, __ATOMIC_RELAXED);
+
+	return n <= first || (n % every) == 0;
+}
+
+/*
  * File sink for bring-ups started from the terminal: between begin and end,
  * lines logged by the calling thread are also appended to QWZ_LOG_FILE with
  * a synchronous write each, so the last line before a hard freeze survives.

@@ -2092,6 +2092,27 @@ struct qwz_softc {
 	int				sc_rx_rate_nss;
 	int				sc_rx_rate_sgi;	/* 1: short guard interval */
 	int8_t				sc_rx_rssi;	/* dBm; 0 until the first frame */
+	/*
+	 * Smoothed RSSI of the associated BSS (qwz_bss_rssi_sample): an EMA, in
+	 * 1/16 dBm, of the frames the AP sends us; reset on every (dis)association.
+	 * ni_rssi stays the raw last-frame value net80211 has always seen.
+	 */
+	int				sc_bss_rssi_fx;
+	int				sc_bss_rssi_valid;
+	uint8_t				sc_bss_rssi_bssid[IEEE80211_ADDR_LEN];
+	uint32_t			sc_bss_rssi_nsamples;	/* this association */
+	uint64_t			sc_bss_rssi_ns;		/* time of the last sample */
+	int				sc_rx_rssi_fresh;	/* last RX descriptor carried an RSSI */
+	int8_t				sc_tx_ack_rssi;		/* last TX-ACK RSSI, dBm; not fed to ni_rssi */
+	/* AWDL receive probe (qwz_awdl_probe_*): passive counters, nothing is dropped. */
+	uint32_t			sc_probe_mgmt_seen;	/* management frames examined */
+	uint32_t			sc_probe_data_seen;	/* data frames examined */
+	uint32_t			sc_awdl_mgmt_action;	/* action, category 127, OUI 00:17:f2 */
+	uint32_t			sc_awdl_mgmt_bssid;	/* management, A3 = AWDL BSSID */
+	uint32_t			sc_awdl_data_bssid;	/* data, A3 = AWDL BSSID */
+	unsigned int			sc_awdl_log_mgmt;	/* log rate limiters */
+	unsigned int			sc_awdl_log_data;
+	uint64_t			sc_probe_summary_ns;	/* last once-a-minute summary */
 	int				num_created_vdevs;
 	int				num_started_vdevs;
 	uint32_t			allocated_vdev_map;
