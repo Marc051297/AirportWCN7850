@@ -52,6 +52,10 @@ public:
 	bool initWithController(IOEthernetController *controller, IOWorkLoop *workloop, IOCommandGate *commandGate) override;
 	void shutdownHardware() override;
 	static IOReturn shutdownGated(OSObject *, void *, void *, void *, void *);
+	void sleepHardware() override;
+	bool wakeNeedsRecovery() override;
+	IOReturn wakeHardware() override;
+	void wakeComplete(bool ok) override;
 	IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
 #ifdef AIRPORT_WCL
 	IOReturn setScanHomeAwayTime(uint32_t ms) override;
@@ -72,6 +76,23 @@ private:
 	bool attached;
 	bool shutdown;		/* shutdownHardware() ran: the chip is already off */
 	char fwVersion[64];
+
+	/* System sleep/wake: PCI config saved at sleep, restored on wake. */
+	IOPCIDevice *pciDev;
+	bool wakeNeeded;	/* the chip was powered down for sleep: full re-init required */
+	struct {
+		bool valid;
+		uint32_t id;
+		uint16_t cmd;
+		uint32_t cls;		/* config 0x0c */
+		uint32_t bar[2];	/* BAR0 (64-bit memory BAR) */
+		uint8_t msiOff, expOff, pmOff;
+		uint16_t msiCtl, msiData, devCtl;
+		uint32_t msiLo, msiHi;
+	} saved;
+	IOPCIDevice *parentBridge(IOService **bus);
+	bool soleDeviceBehind(IOService *bus);
+	void saveConfig();
 };
 
 #endif /* ItlQwz_hpp */

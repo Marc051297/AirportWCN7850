@@ -48,6 +48,19 @@ public:
      * hardware teardown. Default: nothing.
      */
     virtual void shutdownHardware() {}
+
+    /*
+     * System sleep/wake (AirportWCN7850). All three run holding the command
+     * gate. sleepHardware(): power the chip down cleanly and save the PCI
+     * config state. wakeNeedsRecovery(): a full re-init is pending.
+     * wakeHardware(): bring the PCIe link and config space back (the caller
+     * then re-enables the interface, which re-inits the firmware).
+     * wakeComplete(): the caller reports the final outcome. Default: nothing.
+     */
+    virtual void sleepHardware() {}
+    virtual bool wakeNeedsRecovery() { return false; }
+    virtual IOReturn wakeHardware() { return kIOReturnSuccess; }
+    virtual void wakeComplete(bool ok) { (void)ok; }
     
     virtual struct ieee80211com *get80211Controller() = 0;
     

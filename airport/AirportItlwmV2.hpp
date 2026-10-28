@@ -263,6 +263,11 @@ public:
     //pm
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
+    thread_call_t wakeRetryCall;
+    bool noWakeFix;
+    void wakeRecover(bool isRetry);
+    void cancelWakeRetry();
+    static IOReturn wakeRetryGated(OSObject *owner, void *, void *, void *, void *);
     UInt32 pmPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;

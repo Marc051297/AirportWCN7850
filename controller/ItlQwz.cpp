@@ -123,6 +123,7 @@ ItlQwz::attach(IOPCIDevice *device)
 	struct _ifnet *ifp;
 	IOReturn ret;
 
+	pciDev = device;
 	QWZLOG("QwzMac %s attaching to %04x:%04x subsystem %04x:%04x", QWZMAC_VERSION,
 	    device->configRead16(kIOPCIConfigVendorID), device->configRead16(kIOPCIConfigDeviceID),
 	    device->configRead16(kIOPCIConfigSubSystemVendorID),
@@ -221,6 +222,318 @@ ItlQwz::shutdownGated(OSObject *, void *arg0, void *, void *, void *)
 	rw_exit(&that->sc->ioctl_rwl);
 	that->shutdown = true;
 	qwz_logc("qwz: chip powered down for system shutdown\n");
+	return kIOReturnSuccess;
+}
+
+/*
+ * System sleep/wake, modelled on ath12k_core_suspend/_resume and the Linux
+ * PCI core's link recovery (pcie_retrain_link, pci_bridge_secondary_bus_reset).
+ * ErP cuts the M.2 module's power in S3, so the firmware is gone on wake and
+ * the config space may come back blank or the link down. All of this runs
+ * holding the command gate (called from the power-state thread call).
+ */
+#define QWZ_PM_PCIE_LNKCAP	0x0c
+#define QWZ_PM_PCIE_LNKCAP_DLLLARC	(1u << 20)
+#define QWZ_PM_PCIE_LNKCTL	0x10
+#define QWZ_PM_PCIE_LNKCTL_RL	(1u << 5)
+#define QWZ_PM_PCIE_LNKSTA	0x12
+#define QWZ_PM_PCIE_LNKSTA_LT	(1u << 11)
+#define QWZ_PM_PCIE_LNKSTA_DLLLA	(1u << 13)
+#define QWZ_PM_BRIDGE_CTL	0x3e
+#define QWZ_PM_BRIDGE_CTL_SBR	(1u << 6)
+
+static uint64_t
+qwz_pm_ms(void)
+{
+	return getnsecuptime() / 1000000ULL;
+}
+
+IOPCIDevice *
+ItlQwz::parentBridge(IOService **bus)
+{
+	IOService *b, *p;
+
+	*bus = NULL;
+	if (pciDev == NULL || (b = pciDev->getProvider()) == NULL ||
+	    (p = b->getProvider()) == NULL)
+		return NULL;
+	*bus = b;
+	return OSDynamicCast(IOPCIDevice, p);
+}
+
+/* True when the bridge's secondary bus holds this device and nothing else. */
+bool
+ItlQwz::soleDeviceBehind(IOService *bus)
+{
+	OSIterator *it;
+	OSObject *o;
+	int n = 0;
+	bool only = true;
+
+	if (bus == NULL || (it = bus->getChildIterator(gIOServicePlane)) == NULL)
+		return false;
+	while ((o = it->getNextObject()) != NULL) {
+		n++;
+		if (o != pciDev)
+			only = false;
+	}
+	it->release();
+	return only && n == 1;
+}
+
+void
+ItlQwz::saveConfig()
+{
+	UInt8 off = 0;
+
+	bzero(&saved, sizeof(saved));
+	if (pciDev == NULL)
+		return;
+	saved.id = pciDev->configRead32(0);
+	if (saved.id == 0xffffffffu)
+		return;		/* nothing sane to save */
+	saved.cmd = pciDev->configRead16(kIOPCIConfigCommand);
+	saved.cls = pciDev->configRead32(0x0c);
+	saved.bar[0] = pciDev->configRead32(kIOPCIConfigBaseAddress0);
+	saved.bar[1] = pciDev->configRead32(kIOPCIConfigBaseAddress0 + 4);
+	if (pciDev->findPCICapability(kIOPCIMSICapability, &off)) {
+		saved.msiOff = off;
+		saved.msiCtl = pciDev->configRead16(off + 2);
+		saved.msiLo = pciDev->configRead32(off + 4);
+		if (saved.msiCtl & 0x80) {
+			saved.msiHi = pciDev->configRead32(off + 8);
+			saved.msiData = pciDev->configRead16(off + 12);
+		} else
+			saved.msiData = pciDev->configRead16(off + 8);
+	}
+	off = 0;
+	if (pciDev->findPCICapability(kIOPCIPCIExpressCapability, &off)) {
+		saved.expOff = off;
+		saved.devCtl = pciDev->configRead16(off + 8);
+	}
+	off = 0;
+	if (pciDev->findPCICapability(kIOPCIPowerManagementCapability, &off))
+		saved.pmOff = off;
+	saved.valid = true;
+}
+
+void
+ItlQwz::sleepHardware()
+{
+	struct _ifnet *ifp;
+	uint64_t t0 = qwz_pm_ms();
+
+	if (!attached || shutdown || sc == NULL) {
+		qwz_log("qwz: pm: sleep: nothing to do (attached %d shutdown %d)\n", attached, shutdown);
+		qwz_log_publish();
+		return;
+	}
+	ifp = &sc->sc_ic.ic_if;
+	qwz_log("qwz: pm: sleep: stopping the interface, fw_initialized %d\n", sc->fw_initialized);
+	qwz_log_publish();
+	rw_enter_write(&sc->ioctl_rwl);
+	ifp->if_flags &= ~IFF_UP;
+	if (ifp->if_flags & IFF_RUNNING)
+		qwz_stop(ifp);
+	rw_exit(&sc->ioctl_rwl);
+	if (sc->fw_initialized) {
+		qwz_log("qwz: pm: sleep: firmware stop, MHI stop, MSI off, SoC reset (ath12k power down)\n");
+		qwz_log_publish();
+		qwz_core_deinit(sc);
+	}
+	saveConfig();
+	wakeNeeded = true;
+	qwz_log("qwz: pm: sleep: chip down in %llu ms; saved id %08x cmd %04x bar0 %08x:%08x msi %04x/%08x:%08x/%04x devctl %04x\n",
+	    qwz_pm_ms() - t0, saved.id, saved.cmd, saved.bar[1], saved.bar[0],
+	    saved.msiCtl, saved.msiHi, saved.msiLo, saved.msiData, saved.devCtl);
+	qwz_log("qwz: pm: sleep: full re-init required on wake\n");
+	qwz_log_publish();
+}
+
+bool
+ItlQwz::wakeNeedsRecovery()
+{
+	return attached && !shutdown && wakeNeeded;
+}
+
+void
+ItlQwz::wakeComplete(bool ok)
+{
+	if (ok)
+		wakeNeeded = false;
+}
+
+IOReturn
+ItlQwz::wakeHardware()
+{
+	IOService *bus = NULL;
+	IOPCIDevice *br;
+	uint64_t t0 = qwz_pm_ms();
+	uint32_t id;
+	uint16_t brCtl = 0, lsta = 0;
+	uint32_t lcap = 0;
+	UInt8 exp = 0, pm = 0;
+	bool haveExp = false, dlla = false;
+	const char *step = "none (config already valid)";
+	int i;
+
+	if (!attached || shutdown || pciDev == NULL)
+		return kIOReturnNotReady;
+	if (!saved.valid) {
+		qwz_log("qwz: pm: wake: no saved PCI state (sleep never ran?)\n");
+		qwz_log_publish();
+	}
+
+	br = parentBridge(&bus);
+	if (br != NULL && br->findPCICapability(kIOPCIPCIExpressCapability, &exp)) {
+		haveExp = true;
+		lcap = br->configRead32(exp + QWZ_PM_PCIE_LNKCAP);
+		dlla = (lcap & QWZ_PM_PCIE_LNKCAP_DLLLARC) != 0;
+	}
+	id = pciDev->configRead32(0);
+	pciDev->findPCICapability(kIOPCIPowerManagementCapability, &pm);
+	qwz_log("qwz: pm: wake: dev id %08x cmd %04x bar0 %08x pmcsr %04x\n", id,
+	    pciDev->configRead16(kIOPCIConfigCommand),
+	    pciDev->configRead32(kIOPCIConfigBaseAddress0),
+	    pm ? pciDev->configRead16(pm + 4) : 0xffff);
+	if (br != NULL) {
+		if (haveExp) {
+			lsta = br->configRead16(exp + QWZ_PM_PCIE_LNKSTA);
+			brCtl = br->configRead16(QWZ_PM_BRIDGE_CTL);
+			qwz_log("qwz: pm: wake: parent %02x:%02x.%x lnkcap %08x lnkctl %04x lnksta %04x (DLLLA %d) brctl %04x buses %08x\n",
+			    br->getBusNumber(), br->getDeviceNumber(), br->getFunctionNumber(),
+			    lcap, br->configRead16(exp + QWZ_PM_PCIE_LNKCTL), lsta,
+			    (lsta & QWZ_PM_PCIE_LNKSTA_DLLLA) != 0, brCtl,
+			    br->configRead32(0x18));
+		} else
+			qwz_log("qwz: pm: wake: parent bridge has no PCIe capability\n");
+	} else
+		qwz_log("qwz: pm: wake: parent bridge not found in the registry\n");
+	qwz_log_publish();
+
+	if (id == 0xffffffffu) {
+		/* a. wait: the link may still be training */
+		for (i = 0; i < 100 && id == 0xffffffffu; i++) {
+			IOSleep(10);
+			id = pciDev->configRead32(0);
+		}
+		if (id != 0xffffffffu)
+			step = "wait";
+		qwz_log("qwz: pm: wake: after 1 s poll id %08x\n", id);
+		qwz_log_publish();
+	}
+	if (id == 0xffffffffu && br != NULL && haveExp) {
+		/* b. Retrain Link on the parent port (pcie_retrain_link) */
+		uint16_t lc = br->configRead16(exp + QWZ_PM_PCIE_LNKCTL);
+
+		qwz_log("qwz: pm: wake: still down: retraining the parent link\n");
+		qwz_log_publish();
+		br->configWrite16(exp + QWZ_PM_PCIE_LNKCTL, lc | QWZ_PM_PCIE_LNKCTL_RL);
+		for (i = 0; i < 50; i++) {	/* up to 500 ms */
+			IOSleep(10);
+			lsta = br->configRead16(exp + QWZ_PM_PCIE_LNKSTA);
+			if (dlla) {
+				if (lsta & QWZ_PM_PCIE_LNKSTA_DLLLA)
+					break;
+			} else if (!(lsta & QWZ_PM_PCIE_LNKSTA_LT) &&
+			    pciDev->configRead32(0) != 0xffffffffu)
+				break;
+		}
+		IOSleep(100);	/* link-up settle, as pci_bridge_wait_for_secondary_bus */
+		id = pciDev->configRead32(0);
+		qwz_log("qwz: pm: wake: retrain done after ~%d ms: lnksta %04x id %08x\n",
+		    (i + 1) * 10 + 100, br->configRead16(exp + QWZ_PM_PCIE_LNKSTA), id);
+		if (id != 0xffffffffu)
+			step = "retrain";
+		qwz_log_publish();
+	}
+	if (id == 0xffffffffu && br != NULL) {
+		/* c. Secondary Bus Reset, only when this is the one device behind the port */
+		if (!soleDeviceBehind(bus)) {
+			qwz_log("qwz: pm: wake: SBR skipped: other devices behind the parent bridge\n");
+		} else {
+			uint16_t bc = br->configRead16(QWZ_PM_BRIDGE_CTL);
+
+			qwz_log("qwz: pm: wake: secondary bus reset on the parent bridge\n");
+			qwz_log_publish();
+			br->configWrite16(QWZ_PM_BRIDGE_CTL, bc | QWZ_PM_BRIDGE_CTL_SBR);
+			IOSleep(2);		/* PCI_RESET_ASSERT 2 ms (>= 1 ms) */
+			br->configWrite16(QWZ_PM_BRIDGE_CTL, bc & ~QWZ_PM_BRIDGE_CTL_SBR);
+			IOSleep(100);	/* PCIE_RESET_READY: 100 ms before the first access */
+			for (i = 0; i < 100; i++) {	/* up to 1 s */
+				id = pciDev->configRead32(0);
+				if (id != 0xffffffffu)
+					break;
+				IOSleep(10);
+			}
+			qwz_log("qwz: pm: wake: SBR done: id %08x brctl %04x\n", id,
+			    br->configRead16(QWZ_PM_BRIDGE_CTL));
+			if (id != 0xffffffffu)
+				step = "secondary bus reset";
+		}
+		qwz_log_publish();
+	}
+
+	if (id == 0xffffffffu) {
+		qwz_log("qwz: pm: wake: FAILED: device config still reads ffffffff after %llu ms\n", qwz_pm_ms() - t0);
+		qwz_log_publish();
+		return kIOReturnNotResponding;
+	}
+	if (saved.valid && id != saved.id) {
+		qwz_log("qwz: pm: wake: FAILED: device id %08x is not the saved %08x\n", id, saved.id);
+		qwz_log_publish();
+		return kIOReturnNotResponding;
+	}
+
+	/* d. config is valid: D0 first, then restore what a power loss wipes */
+	if (pm) {
+		uint16_t pmcsr = pciDev->configRead16(pm + 4);
+
+		if (pmcsr & 3) {
+			qwz_log("qwz: pm: wake: PMCSR %04x: moving to D0 (10 ms settle)\n", pmcsr);
+			pciDev->configWrite16(pm + 4, pmcsr & ~0x8003);
+			IOSleep(10);
+		}
+	}
+	if (saved.valid) {
+		UInt8 off = saved.msiOff;
+
+		if (pciDev->configRead32(kIOPCIConfigBaseAddress0) != saved.bar[0] ||
+		    pciDev->configRead32(kIOPCIConfigBaseAddress0 + 4) != saved.bar[1]) {
+			qwz_log("qwz: pm: wake: BAR0 %08x:%08x lost: restoring %08x:%08x\n",
+			    pciDev->configRead32(kIOPCIConfigBaseAddress0 + 4),
+			    pciDev->configRead32(kIOPCIConfigBaseAddress0), saved.bar[1], saved.bar[0]);
+			pciDev->configWrite16(kIOPCIConfigCommand, 0);	/* decode off while BARs move */
+			pciDev->configWrite32(kIOPCIConfigBaseAddress0, saved.bar[0]);
+			pciDev->configWrite32(kIOPCIConfigBaseAddress0 + 4, saved.bar[1]);
+		}
+		if (pciDev->configRead32(0x0c) != saved.cls)
+			pciDev->configWrite32(0x0c, saved.cls);
+		if (off && (pciDev->configRead32(off + 4) != saved.msiLo ||
+		    ((saved.msiCtl & 0x80) && pciDev->configRead32(off + 8) != saved.msiHi) ||
+		    pciDev->configRead16(off + ((saved.msiCtl & 0x80) ? 12 : 8)) != saved.msiData)) {
+			qwz_log("qwz: pm: wake: MSI address/data lost: restoring %08x:%08x/%04x\n",
+			    saved.msiHi, saved.msiLo, saved.msiData);
+			pciDev->configWrite32(off + 4, saved.msiLo);
+			if (saved.msiCtl & 0x80) {
+				pciDev->configWrite32(off + 8, saved.msiHi);
+				pciDev->configWrite16(off + 12, saved.msiData);
+			} else
+				pciDev->configWrite16(off + 8, saved.msiData);
+			pciDev->configWrite16(off + 2, saved.msiCtl);	/* MSI stays off: power_up enables it */
+		}
+		if (saved.expOff && pciDev->configRead16(saved.expOff + 8) != saved.devCtl)
+			pciDev->configWrite16(saved.expOff + 8, saved.devCtl);
+		pciDev->configWrite16(kIOPCIConfigCommand,
+		    saved.cmd | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+	} else {
+		pciDev->configWrite16(kIOPCIConfigCommand,
+		    pciDev->configRead16(kIOPCIConfigCommand) | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+	}
+	qwz_log("qwz: pm: wake: PCI ready (recovery step: %s) in %llu ms: id %08x cmd %04x bar0 %08x\n",
+	    step, qwz_pm_ms() - t0, pciDev->configRead32(0),
+	    pciDev->configRead16(kIOPCIConfigCommand), pciDev->configRead32(kIOPCIConfigBaseAddress0));
+	qwz_log_publish();
 	return kIOReturnSuccess;
 }
 
