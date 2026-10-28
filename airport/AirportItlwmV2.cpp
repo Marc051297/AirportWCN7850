@@ -390,21 +390,6 @@ bool AirportItlwm::start(IOService *provider)
     }
     qwz_log("qwz: trace: AirportItlwm::start: HAL attached; watchdog\n");
 
-    /* Pre-create AWDL virtual interface during boot.
-     * This makes awdl0 appear immediately so wifip2pd/sharingd can use it.
-     * Based on ReAWDL project approach (maddog860). */
-    {
-        ether_addr awdlAddr;
-        struct ieee80211com *ic_tmp = fHalService->get80211Controller();
-        memcpy(awdlAddr.octet, ic_tmp->ic_myaddr, 6);
-        awdlAddr.octet[0] = (awdlAddr.octet[0] | 0x02) & 0xFE;  /* locally administered */
-        awdlAddr.octet[5] ^= 0x01;
-        IO80211VirtualInterface *awdlVif = NULL;
-        bool awdlOk = attachVirtualInterface(&awdlVif, &awdlAddr,
-                                              APPLE80211_VIF_AWDL, true);
-        XYLog("AWDL: boot attach=%d vif=%p\n", awdlOk, awdlVif);
-    }
-
     fWatchdogWorkLoop = IOWorkLoop::workLoop();
     if (fWatchdogWorkLoop == NULL) {
         XYLog("init watchdog workloop fail\n");
@@ -1057,12 +1042,9 @@ getCARD_CAPABILITIES(OSObject *object,
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
 
-    /* AWDL capability bits — tells wifip2pd this card supports AWDL.
-     * Without these, wifip2pd logs "device is missing the capability"
-     * and never requests the awdl0 interface. */
-    cd->capabilities[3] |= 0x80;   /* AWDL supported */
-    cd->capabilities[4] |= 0x04;   /* AWDL feature: CCA stats */
-    cd->capabilities[6] |= 0x10;   /* Virtual interface capable */
+    // Capability index 32: wifip2pd only requests an AWDL interface when it is set,
+    // and System Information prints "AirDrop: Supported" from the same index.
+    cd->capabilities[4] |= 0x01;
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;
@@ -1471,7 +1453,8 @@ void AirportItlwm::setPowerStateOn()
 IO80211VirtualInterface *
 AirportItlwm::createVirtualInterface(ether_addr *ether, UInt role)
 {
-    XYLog("AWDL: createVirtualInterface role=%u\n", role);
+    qwz_log("airport: AWDL createVirtualInterface role=%u\n", role);
+    qwz_log_publish();
 
     /* Let the superclass handle it — on Tahoe, IO80211Controller's
      * attachVirtualInterface does the allocation internally when

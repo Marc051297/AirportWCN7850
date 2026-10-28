@@ -9,10 +9,6 @@
 #include "AirportItlwmSkywalkInterface.hpp"
 #include "qwz_log.h"
 
-/* Forward declare for AWDL virtual interface — full header conflicts with existing includes */
-class IO80211VirtualInterface;
-extern const char *IO80211VirtualInterface_getBSDName(IO80211VirtualInterface *);
-
 /* The first few calls of a link getter go to the log ring: what is asked, what is answered. */
 #define LINK_TRACE(fmt, ...) do { \
     static int calls_; \
@@ -1153,48 +1149,24 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
 #endif
 
 /*
- * AWDL virtual interface creation — M0 shell for AirDrop experiment.
- * When wifip2pd requests an AWDL interface, we create a virtual interface
- * named "awdl0" pinned to channel 149/80 MHz (social channel).
- * This gets AirDrop to open its UI even though we can't do real AWDL.
+ * Records what wifip2pd asks for, then declines: there is no Tahoe AWDL
+ * interface class yet, and a half-created one is worse than none.
  */
 IOReturn AirportItlwmSkywalkInterface::
 setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
 {
+    static uint32_t requests;
+
     if (!data)
         return kIOReturnBadArgument;
 
-    XYLog("AWDL: setVIRTUAL_IF_CREATE role=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-          data->role, data->mac[0], data->mac[1], data->mac[2],
-          data->mac[3], data->mac[4], data->mac[5]);
-
-    if (data->role != APPLE80211_VIF_AWDL) {
-        XYLog("AWDL: unsupported VIF role %u\n", data->role);
-        return kIOReturnUnsupported;
+    if (++requests <= 8 || (requests & 63) == 0) {
+        qwz_log("airport: AWDL VIRTUAL_IF_CREATE #%u version=%u role=%u unk1=0x%x "
+                "mac=%02x:%02x:%02x:%02x:%02x:%02x -> unsupported\n",
+                requests, data->version, data->role, data->unk1,
+                data->mac[0], data->mac[1], data->mac[2],
+                data->mac[3], data->mac[4], data->mac[5]);
+        qwz_log_publish();
     }
-
-    /* Create the AWDL virtual interface via IO80211Controller.
-     * attachVirtualInterface creates an IO80211VirtualInterface,
-     * initializes it with the AWDL role, and attaches it to IOKit. */
-    ether_addr addr;
-    memcpy(addr.octet, data->mac, 6);
-
-    /* The controller (AirportItlwm, which inherits IO80211Controller)
-     * owns the attachVirtualInterface method. Get it from the provider. */
-    IO80211Controller *ctrl = OSDynamicCast(IO80211Controller, getProvider());
-    if (!ctrl) {
-        XYLog("AWDL: cannot find IO80211Controller provider\n");
-        return kIOReturnNotReady;
-    }
-
-    IO80211VirtualInterface *vif = NULL;
-    bool ok = ctrl->attachVirtualInterface(&vif, &addr, data->role, true);
-    if (!ok || !vif) {
-        XYLog("AWDL: attachVirtualInterface failed\n");
-        return kIOReturnError;
-    }
-
-    snprintf((char *)data->bsd_name, IFNAMSIZ, "awdl0");
-    XYLog("AWDL: virtual interface created: %s\n", data->bsd_name);
-    return kIOReturnSuccess;
+    return kIOReturnUnsupported;
 }
