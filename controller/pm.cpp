@@ -128,12 +128,23 @@ IOReturn itlwm::registerWithPolicyMaker(IOService *policyMaker)
 
 void itlwm::setPowerStateOff()
 {
+    /* Mirror OpenBSD qwz_activate DVACT_QUIESCE: tear down the interface
+       and firmware so the chip can survive PCI power-down during sleep. */
+    if (fHalService) {
+        fHalService->disable(fNetIf);
+        fHalService->shutdownHardware();
+    }
     pmPowerState = kPowerStateOff;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
 
 void itlwm::setPowerStateOn()
 {
+    /* Mirror OpenBSD qwz_activate DVACT_WAKEUP: reload firmware,
+       re-init hardware, and let net80211 re-scan + re-associate. */
+    if (fHalService) {
+        fHalService->enable(fNetIf);
+    }
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
 }

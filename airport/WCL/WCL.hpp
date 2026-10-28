@@ -117,6 +117,7 @@ inline bool makeBeaconUpdate(uint32_t receivedDelta, int rssi, int noise, LqmBea
     if (!receivedDelta)
         return false;
     out.receivedDelta = receivedDelta;
+    out.scheduledDelta = receivedDelta;  /* assume all expected beacons arrived */
     out.beaconValid = out.snapshotValid = out.countersValid = 1;
     if (rssi < 0) {
         out.rssiValid = 1;
@@ -125,6 +126,20 @@ inline bool makeBeaconUpdate(uint32_t receivedDelta, int rssi, int noise, LqmBea
     if (noise < 0) {
         out.noiseValid = 1;
         out.noise = (int16_t)noise;
+    }
+    /* CCA: estimate channel busy percentage from SNR.
+     * Strong signal (SNR>30) → low CCA (~10%). Weak signal → higher CCA.
+     * This gives WCL a non-zero congestion metric to factor into LQM. */
+    if (rssi < 0 && noise < 0) {
+        int snr = rssi - noise;
+        uint8_t estimated_cca;
+        if (snr >= 40) estimated_cca = 5;
+        else if (snr >= 30) estimated_cca = 15;
+        else if (snr >= 20) estimated_cca = 30;
+        else if (snr >= 10) estimated_cca = 50;
+        else estimated_cca = 70;
+        out.ccaValid = 1;
+        out.cca = estimated_cca;
     }
     return true;
 }
@@ -539,9 +554,12 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
         return LegacyAuth::Invalid;
     }
     const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
+    const uint32_t sae_bits = (1u << 12) | (1u << 13);  /* WPA3-SAE, FT-SAE */
     const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
-    if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
-    if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
+    if (j.upperAuth & ~(personal | sae_bits | enterprise)) return LegacyAuth::Invalid;
+    if ((j.upperAuth & (personal | sae_bits)) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
+    if (j.upperAuth & sae_bits)
+        return isPassphrase(j) ? LegacyAuth::Personal : LegacyAuth::Invalid;
     if (j.upperAuth & personal)
         return (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)) || isPassphrase(j) ?
             LegacyAuth::Personal : LegacyAuth::Invalid;

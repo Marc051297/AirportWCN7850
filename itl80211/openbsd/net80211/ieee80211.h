@@ -963,6 +963,7 @@ enum ieee80211_edca_ac {
  */
 #define IEEE80211_AUTH_ALG_OPEN			0x0000
 #define IEEE80211_AUTH_ALG_SHARED		0x0001
+#define IEEE80211_AUTH_ALG_SAE			0x0003	/* WPA3-Personal */
 #define IEEE80211_AUTH_ALG_LEAP			0x0080
 
 /*

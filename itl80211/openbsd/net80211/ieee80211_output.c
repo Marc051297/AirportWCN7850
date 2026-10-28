@@ -1481,16 +1481,23 @@ ieee80211_get_auth(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	mbuf_t m;
     u_int8_t *frm;
-    
+    u_int16_t algo = IEEE80211_AUTH_ALG_OPEN;
+
+    /* Use SAE algorithm if the node's AKM includes SAE */
+    if (ni->ni_rsnakms & (IEEE80211_AKM_SAE | IEEE80211_AKM_FT_SAE))
+        algo = IEEE80211_AUTH_ALG_SAE;
+
+    /* SAE commit/confirm data is appended by the caller via ic_sae_tx.
+     * The base auth frame is just the 6-byte header. */
     mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
     if (m == NULL)
         return NULL;
     mbuf_align_32(m, 2 * 3);
     mbuf_pkthdr_setlen(m, 2 * 3);
     mbuf_setlen(m, 2 * 3);
-    
+
     frm = mtod(m, u_int8_t *);
-    LE_WRITE_2(frm, IEEE80211_AUTH_ALG_OPEN); frm += 2;
+    LE_WRITE_2(frm, algo); frm += 2;
     LE_WRITE_2(frm, seq); frm += 2;
     LE_WRITE_2(frm, status);
 

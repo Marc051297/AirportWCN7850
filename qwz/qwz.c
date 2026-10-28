@@ -15501,8 +15501,29 @@ qwz_dp_rx_h_rate(struct qwz_softc *sc, struct hal_rx_desc *rx_desc,
 			return;
 		sc->sc_rx_rate_mcs = mcs;
 		break;
+	case HAL_TX_RATE_STATS_PKT_TYPE_11AX: {
+		/* HE: MCS 0-11, NSD differs from VHT (more subcarriers). */
+		static const uint32_t he_mcs_kbps[] = { 8600, 17200, 25800,
+		    34400, 51600, 68800, 77400, 86000, 103200, 114700,
+		    129000, 143400 };
+		static const uint16_t he_bw_nsd[] = { 234, 468, 980, 1960 };
+		if (mcs > 11 || nss == 0 ||
+		    bw > RX_MSDU_START_RECV_BW_160MHZ)
+			return;
+		sc->sc_rx_rate_mcs = mcs;
+		kbps = he_mcs_kbps[mcs] * nss * he_bw_nsd[bw] / 234;
+		if (sgi == RX_MSDU_START_SGI_0_8_US)
+			kbps = kbps * 10 / 9;  /* 0.8us GI */
+		else if (sgi == RX_MSDU_START_SGI_1_6_US)
+			kbps = kbps * 40 / 37; /* 1.6us GI */
+		/* 3.2us GI is the base rate (no adjustment) */
+		sc->sc_rx_rate_kbps = kbps;
+		sc->sc_rx_rate_nss = nss;
+		sc->sc_rx_rate_sgi = (sgi == RX_MSDU_START_SGI_0_8_US);
+		return;
+	}
 	default:
-		return;	/* 11ax/11be are not driven */
+		return;	/* 11be not yet driven */
 	}
 	kbps = mcs_kbps[mcs] * nss * bw_nsd[bw] / 52;
 	if (sgi == RX_MSDU_START_SGI_0_4_US)
@@ -25225,13 +25246,12 @@ qwz_peer_assoc_h_crypto(struct qwz_softc *sc, struct qwz_vif *arvif,
 		arg->need_ptk_4_way = 1;
 		if (ni->ni_rsnprotos == IEEE80211_PROTO_WPA)
 			arg->need_gtk_2_way = 1;
+
+		/* Enable PMF if the AP advertises MFP Capable or Required.
+		 * SAE (WPA3) mandates PMF (MFPR). */
+		if (ni->ni_rsncaps & (IEEE80211_RSNCAP_MFPC | IEEE80211_RSNCAP_MFPR))
+			arg->is_pmf_enabled = 1;
 	}
-#if 0
-	if (sta->mfp) {
-		/* TODO: Need to check if FW supports PMF? */
-		arg->is_pmf_enabled = true;
-	}
-#endif
 }
 
 int

@@ -9,6 +9,10 @@
 #include "AirportItlwmSkywalkInterface.hpp"
 #include "qwz_log.h"
 
+/* Forward declare for AWDL virtual interface — full header conflicts with existing includes */
+class IO80211VirtualInterface;
+extern const char *IO80211VirtualInterface_getBSDName(IO80211VirtualInterface *);
+
 /* The first few calls of a link getter go to the log ring: what is asked, what is answered. */
 #define LINK_TRACE(fmt, ...) do { \
     static int calls_; \
@@ -626,12 +630,10 @@ getRATE(struct apple80211_rate_data *rd)
         rd->version = APPLE80211_VERSION;
         rd->num_radios = 1;
         sgi = ieee80211_node_supports_sgi(ic->ic_bss);
-        /* The MT7922 firmware picks TX rates itself and reports none; its last RX rate is the best estimate. */
+        /* Use RX rate from data frames if available; otherwise compute from negotiated MCS. */
         uint32_t rx_kbps = fHalService->getDriverInfo()->getRxRateKbps();
-        if (rx_kbps != 0 && (ic->ic_bss->ni_flags & (IEEE80211_NODE_HE | IEEE80211_NODE_VHT | IEEE80211_NODE_HT))) {
+        if (rx_kbps > 1000 && (ic->ic_bss->ni_flags & (IEEE80211_NODE_HE | IEEE80211_NODE_VHT | IEEE80211_NODE_HT))) {
             rd->rate[0] = (rx_kbps + 500) / 1000;
-        } else if (ic->ic_bss->ni_flags & IEEE80211_NODE_HE) {
-            rd->rate[0] = 0;
         } else if (ic->ic_curmode == IEEE80211_MODE_11AC) {
             if (sgi)
                 index += 1;
@@ -694,12 +696,19 @@ getRX_RATE(struct apple80211_rate_data *rd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
     uint32_t rx_kbps = fHalService->getDriverInfo()->getRxRateKbps();
-    if (ic->ic_state != IEEE80211_S_RUN || rx_kbps == 0)
+    if (ic->ic_state != IEEE80211_S_RUN)
         return 6;
     memset(rd, 0, sizeof(*rd));
     rd->version = APPLE80211_VERSION;
     rd->num_radios = 1;
-    rd->rate[0] = (rx_kbps + 500) / 1000;
+    if (rx_kbps > 1000) {
+        rd->rate[0] = (rx_kbps + 500) / 1000;
+    } else {
+        /* No recent RX data rate — use getRATE() fallback */
+        apple80211_rate_data fallback = {};
+        if (getRATE(&fallback) == kIOReturnSuccess)
+            rd->rate[0] = fallback.rate[0];
+    }
     LINK_TRACE("rate %u", rd->rate[0]);
     return kIOReturnSuccess;
 }
@@ -801,7 +810,7 @@ getNOISE(struct apple80211_noise_data *nd)
         nd->version = APPLE80211_VERSION;
         nd->num_radios = 1;
         nd->noise[0]
-        = nd->aggregate_noise = -fHalService->getDriverInfo()->getBSSNoise();
+        = nd->aggregate_noise = fHalService->getDriverInfo()->getBSSNoise();  /* already dBm */
         nd->noise_unit = APPLE80211_UNIT_DBM;
         return kIOReturnSuccess;
     }
@@ -1061,7 +1070,7 @@ static int convertNodeToScanResult(ItlHalService *fHalService, struct ieee80211_
     result->asr_channel.version = APPLE80211_VERSION;
     result->asr_channel.channel = ieee80211_chan2ieee(fHalService->get80211Controller(), fNextNodeToSend->ni_chan);
     result->asr_channel.flags = ieeeChanFlag2appleScanFlagVentura(fNextNodeToSend->ni_chan->ic_flags);
-    result->asr_noise = -fHalService->getDriverInfo()->getBSSNoise();
+    result->asr_noise = fHalService->getDriverInfo()->getBSSNoise();  /* already dBm */
     result->asr_rssi = (int8_t)fNextNodeToSend->ni_rssi;	/* dBm */
     memcpy(result->asr_bssid, fNextNodeToSend->ni_bssid, IEEE80211_ADDR_LEN);
     result->asr_ssid_len = fNextNodeToSend->ni_esslen;
@@ -1142,3 +1151,50 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
     return kIOReturnUnsupported;
 }
 #endif
+
+/*
+ * AWDL virtual interface creation — M0 shell for AirDrop experiment.
+ * When wifip2pd requests an AWDL interface, we create a virtual interface
+ * named "awdl0" pinned to channel 149/80 MHz (social channel).
+ * This gets AirDrop to open its UI even though we can't do real AWDL.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+
+    XYLog("AWDL: setVIRTUAL_IF_CREATE role=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+          data->role, data->mac[0], data->mac[1], data->mac[2],
+          data->mac[3], data->mac[4], data->mac[5]);
+
+    if (data->role != APPLE80211_VIF_AWDL) {
+        XYLog("AWDL: unsupported VIF role %u\n", data->role);
+        return kIOReturnUnsupported;
+    }
+
+    /* Create the AWDL virtual interface via IO80211Controller.
+     * attachVirtualInterface creates an IO80211VirtualInterface,
+     * initializes it with the AWDL role, and attaches it to IOKit. */
+    ether_addr addr;
+    memcpy(addr.octet, data->mac, 6);
+
+    /* The controller (AirportItlwm, which inherits IO80211Controller)
+     * owns the attachVirtualInterface method. Get it from the provider. */
+    IO80211Controller *ctrl = OSDynamicCast(IO80211Controller, getProvider());
+    if (!ctrl) {
+        XYLog("AWDL: cannot find IO80211Controller provider\n");
+        return kIOReturnNotReady;
+    }
+
+    IO80211VirtualInterface *vif = NULL;
+    bool ok = ctrl->attachVirtualInterface(&vif, &addr, data->role, true);
+    if (!ok || !vif) {
+        XYLog("AWDL: attachVirtualInterface failed\n");
+        return kIOReturnError;
+    }
+
+    snprintf((char *)data->bsd_name, IFNAMSIZ, "awdl0");
+    XYLog("AWDL: virtual interface created: %s\n", data->bsd_name);
+    return kIOReturnSuccess;
+}

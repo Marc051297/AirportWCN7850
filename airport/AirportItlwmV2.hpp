@@ -168,7 +168,10 @@ public:
     IOTimerEventSource *roleTimer;
     uint32_t roleChecks;
     void watchdogAction(IOTimerEventSource *timer);
-    
+
+    /* AWDL virtual interface — override to create awdl0 */
+    virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *ether, UInt role) override;
+
     virtual SInt32 enableFeature(IO80211FeatureCode, void*) override;
     /* Every request the family does not answer itself passes here first; the first of each id is logged. */
     virtual bool isCommandProhibited(int command) override;

@@ -4,3 +4,7 @@ build/
 build-debug/
 deps/
 .DS_Store
+build-fixes/
+deps/
+firmware/dl/
+firmware/FwBinary.cpp

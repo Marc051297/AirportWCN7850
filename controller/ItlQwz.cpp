@@ -319,7 +319,7 @@ ItlQwz::getFirmwareVersion()
 int16_t
 ItlQwz::getBSSNoise()
 {
-	return -95;	/* qwz does not report a noise floor */
+	return -95;	/* dBm; getNOISE() and scan results must not negate */
 }
 
 bool

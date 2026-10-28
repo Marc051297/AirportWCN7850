@@ -288,7 +288,9 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->ssidLength = node->ni_esslen;
     memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
     memcpy(metadata->bssid, node->ni_bssid, 6);
-    metadata->rssi = IWM_MIN_DBM + node->ni_rssi;
+    metadata->rssi = (int8_t)node->ni_rssi;  /* qwz stores dBm directly as uint8; cast to signed */
+    metadata->noise = fHalService->getDriverInfo()->getBSSNoise();  /* -95 dBm */
+    metadata->snr = metadata->rssi - metadata->noise;  /* e.g. -48 - (-95) = 47 dB */
     metadata->interval = node->ni_intval;
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
@@ -435,6 +437,14 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
         if (join.upperAuth & APPLE80211_AUTHTYPE_SHA256_8021X)
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
+        if (join.upperAuth & APPLE80211_AUTHTYPE_WPA3_SAE) {
+            wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
+            wpa.i_akms |= IEEE80211_WPA_AKM_PSK;  /* SAE falls back to PSK AKM for now */
+        }
+        if (join.upperAuth & APPLE80211_AUTHTYPE_WPA3_FT_SAE) {
+            wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
+            wpa.i_akms |= IEEE80211_WPA_AKM_PSK;
+        }
         wpa.i_ciphers = IEEE80211_WPA_CIPHER_CCMP | IEEE80211_WPA_CIPHER_TKIP;
         if (join.rsnLength >= 8 && join.rsn[0] == IEEE80211_ELEMID_RSN &&
             join.rsn[4] == 0 && join.rsn[5] == 0x0f && join.rsn[6] == 0xac) {

@@ -157,7 +157,7 @@ bool itlwm::createMediumTables(const IONetworkMedium **primary)
         return false;
     }
     
-    medium = IONetworkMedium::medium(kIOMediumEthernetAuto, 100 * 1000000);
+    medium = IONetworkMedium::medium(kIOMediumEthernetAuto, 1000 * 1000000ULL);  /* 1 Gbps for VHT80 */
     IONetworkMedium::addMedium(mediumDict, medium);
     medium->release();
     if (primary) {

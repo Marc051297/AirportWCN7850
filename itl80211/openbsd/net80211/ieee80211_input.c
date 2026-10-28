@@ -1477,6 +1477,10 @@ ieee80211_parse_rsn_akm(const u_int8_t selector[4])
                 return IEEE80211_AKM_SHA256_8021X;
             case 6:    /* PSK with SHA256 KDF */
                 return IEEE80211_AKM_SHA256_PSK;
+            case 8:    /* SAE (WPA3-Personal) */
+                return IEEE80211_AKM_SAE;
+            case 9:    /* FT over SAE */
+                return IEEE80211_AKM_FT_SAE;
         }
     }
     return IEEE80211_AKM_NONE;    /* ignore unknown AKMs */
@@ -2327,7 +2331,20 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
     
-    /* only "open" auth mode is supported */
+    if (algo == IEEE80211_AUTH_ALG_SAE) {
+        /* SAE auth frame: commit (seq=1) or confirm (seq=2).
+         * The payload after the 6-byte auth header contains the
+         * SAE-specific data. Pass to the SAE handler if registered. */
+        if (ic->ic_sae_rx != NULL) {
+            size_t payload_len = mbuf_len(m) - sizeof(*wh) - 6;
+            ic->ic_sae_rx(ic, ni, seq, status, frm, payload_len);
+        } else {
+            DPRINTF(("SAE auth frame but no handler registered\n"));
+        }
+        return;
+    }
+
+    /* only "open" auth mode is supported for non-SAE */
     if (algo != IEEE80211_AUTH_ALG_OPEN) {
         DPRINTF(("unsupported auth algorithm %d from %s\n",
                  algo, ether_sprintf((u_int8_t *)wh->i_addr2)));

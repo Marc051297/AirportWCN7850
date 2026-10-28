@@ -454,6 +454,13 @@ struct ieee80211com {
     bool ic_wcl_scan_idle;   /* scan finished, nothing asked for: wait for macOS */
 #endif
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
+
+	/* SAE (WPA3) auth callback — set by the driver to handle
+	 * SAE commit/confirm frames received from the AP. */
+	void		(*ic_sae_rx)(struct ieee80211com *,
+			    struct ieee80211_node *, uint16_t seq,
+			    uint16_t status, const uint8_t *data, size_t len);
+
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
