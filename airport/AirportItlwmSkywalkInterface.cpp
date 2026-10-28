@@ -612,6 +612,23 @@ getTXPOWER(struct apple80211_txpower_data *txd)
     return 6;
 }
 
+/*
+ * 802.11ax data rate in kbit/s from the standard's formula: data subcarriers
+ * x coded bits per subcarrier x NSS / symbol time.  gi_x10 is the guard
+ * interval in 0.1 us (8, 16, 32); the symbol is 12.8 us plus that.  Not
+ * ieee80211_std_ratesets_11ax: its two-stream rows are wrong.
+ */
+static uint32_t heRateKbps(int mcs, int nss, int bw_mhz, int gi_x10)
+{
+    /* Coded bits per data subcarrier x 6: BPSK 1/2 (MCS 0) ... 1024-QAM 5/6 (MCS 11). */
+    static const uint8_t sixths[12] = { 3, 6, 9, 12, 18, 24, 27, 30, 36, 40, 45, 50 };
+    uint64_t nsd = bw_mhz >= 160 ? 1960 : bw_mhz >= 80 ? 980 : bw_mhz >= 40 ? 468 : 234;
+
+    if (mcs < 0 || mcs > 11 || nss < 1)
+        return 0;
+    return (uint32_t)(nsd * sixths[mcs] * (uint64_t)nss * 10000 / (uint64_t)(6 * (128 + gi_x10)));
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 getRATE(struct apple80211_rate_data *rd)
 {
@@ -630,6 +647,38 @@ getRATE(struct apple80211_rate_data *rd)
         uint32_t rx_kbps = fHalService->getDriverInfo()->getRxRateKbps();
         if (rx_kbps > 1000 && (ic->ic_bss->ni_flags & (IEEE80211_NODE_HE | IEEE80211_NODE_VHT | IEEE80211_NODE_HT))) {
             rd->rate[0] = (rx_kbps + 500) / 1000;
+        } else if (ic->ic_curmode == IEEE80211_MODE_11AX || (ic->ic_bss->ni_flags & IEEE80211_NODE_HE)) {
+            /* HE link with no recent data frame: the measured MCS and NSS if any, else the best the maps allow. */
+            struct ieee80211_node *ni = ic->ic_bss;
+            nss = fHalService->getDriverInfo()->getRxRateNss();
+            if (nss < 1)
+                nss = fHalService->getDriverInfo()->getTxNSS();
+            if (nss < 1)
+                nss = 1;
+            if (nss > 8)
+                nss = 8;
+            int mcs = fHalService->getDriverInfo()->getRxRateMcs();
+            if (mcs < 0 || mcs > 11) {
+                uint16_t map = ieee80211_he_mcs_intersection(le16toh(ic->ic_he_mcs_nss_supp.tx_mcs_80),
+                                                            le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_80));
+                switch ((map >> (2 * (nss - 1))) & 3) {
+                    case IEEE80211_HE_MCS_SUPPORT_0_11: mcs = 11; break;
+                    case IEEE80211_HE_MCS_SUPPORT_0_9: mcs = 9; break;
+                    case IEEE80211_HE_MCS_SUPPORT_0_7: mcs = 7; break;
+                    default: mcs = 0; break;
+                }
+            }
+            int bw = 20;
+            switch (ni->ni_chw) {
+                case IEEE80211_CHAN_WIDTH_40: bw = 40; break;
+                case IEEE80211_CHAN_WIDTH_80: bw = 80; break;
+                case IEEE80211_CHAN_WIDTH_80P80:
+                case IEEE80211_CHAN_WIDTH_160: bw = 160; break;
+                default: break;
+            }
+            /* 1.6 us when the last frame was known to use a longer GI than 0.8 us, else the 0.8 us capability. */
+            int rxsgi = fHalService->getDriverInfo()->getRxRateSgi();
+            rd->rate[0] = (heRateKbps(mcs, nss, bw, rxsgi == 0 ? 16 : 8) + 500) / 1000;
         } else if (ic->ic_curmode == IEEE80211_MODE_11AC) {
             if (sgi)
                 index += 1;
@@ -668,6 +717,32 @@ getRATE(struct apple80211_rate_data *rd)
         return kIOReturnSuccess;
     }
     return 6;
+}
+
+/*
+ * Neither Tahoe getter is implemented; these log the first ask each, so the
+ * ring shows whether the WCL path queries them once HE is on (itlwm_he=1).
+ */
+IOReturn AirportItlwmSkywalkInterface::
+getHE_CAPABILITY(apple80211_he_capability *)
+{
+    static bool asked;
+    if (!asked) {
+        asked = true;
+        qwz_log("airport: getHE_CAPABILITY asked (answered unsupported)\n");
+    }
+    return kIOReturnUnsupported;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+getHE_MCS_INDEX_SET(apple80211_he_mcs_index_set_data *)
+{
+    static bool asked;
+    if (!asked) {
+        asked = true;
+        qwz_log("airport: getHE_MCS_INDEX_SET asked (answered unsupported)\n");
+    }
+    return kIOReturnUnsupported;
 }
 
 IOReturn AirportItlwmSkywalkInterface::

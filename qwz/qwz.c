@@ -130,6 +130,7 @@ int qwz_qmi_event_server_arrive(struct qwz_softc *);
 int qwz_mac_register(struct qwz_softc *);
 int qwz_mac_start(struct qwz_softc *);
 void qwz_mac_setup_ht_vht_cap(struct qwz_softc *, struct qwz_pdev *);
+void qwz_mac_setup_he_cap(struct qwz_softc *, struct qwz_pdev *);
 uint32_t qwz_vht80_center_freq(uint32_t);
 int qwz_node_ht40(struct qwz_softc *, struct ieee80211_node *);
 int qwz_vdev_width(struct qwz_vif *);
@@ -484,6 +485,14 @@ full_init:
 		    ((struct arpcom *)ifp)->ac_enaddr);
 	} else {
 		sc->attached = 1;
+
+		/*
+		 * macOS: with itlwm_he=1, fill in the HE capabilities and set
+		 * HEON first, so that channel_init adds MODE_11AX and C_HE.
+		 * A no-op without the boot-arg.
+		 */
+		if (sc->num_radios > 0)
+			qwz_mac_setup_he_cap(sc, &sc->pdevs[0]);
 
 		/* Configure channel information obtained from firmware. */
 		ieee80211_channel_init(ifp);
@@ -15512,11 +15521,15 @@ qwz_dp_rx_h_rate(struct qwz_softc *sc, struct hal_rx_desc *rx_desc,
 			return;
 		sc->sc_rx_rate_mcs = mcs;
 		kbps = he_mcs_kbps[mcs] * nss * he_bw_nsd[bw] / 234;
-		if (sgi == RX_MSDU_START_SGI_0_8_US)
-			kbps = kbps * 10 / 9;  /* 0.8us GI */
-		else if (sgi == RX_MSDU_START_SGI_1_6_US)
-			kbps = kbps * 40 / 37; /* 1.6us GI */
-		/* 3.2us GI is the base rate (no adjustment) */
+		/*
+		 * The table is the 0.8us GI rate (symbol 12.8 + 0.8 = 13.6us);
+		 * 1.6us GI is a 14.4us symbol (x 17/18), 3.2us GI a 16us one
+		 * (x 17/20).
+		 */
+		if (sgi == RX_MSDU_START_SGI_1_6_US)
+			kbps = kbps * 17 / 18;
+		else if (sgi == RX_MSDU_START_SGI_3_2_US)
+			kbps = kbps * 17 / 20;
 		sc->sc_rx_rate_kbps = kbps;
 		sc->sc_rx_rate_nss = nss;
 		sc->sc_rx_rate_sgi = (sgi == RX_MSDU_START_SGI_0_8_US);
@@ -18174,8 +18187,17 @@ qwz_wmi_send_peer_assoc_cmd(struct qwz_softc *sc, uint8_t pdev_id,
 		    WMI_TAG_HE_RATE_SET) |
 		    FIELD_PREP(WMI_TLV_LEN, sizeof(*he_mcs) - TLV_HDR_SIZE);
 
-		he_mcs->rx_mcs_set = param->peer_he_tx_mcs_set[i];
-		he_mcs->tx_mcs_set = param->peer_he_rx_mcs_set[i];
+		/*
+		 * As ath12k wmi.c, which never swapped the HE sets (qwz had
+		 * inherited a swap from ath11k): rx_mcs_set = peer_he_rx_mcs_set,
+		 * tx_mcs_set = peer_he_tx_mcs_set.  qwz_peer_assoc_h_he() fills
+		 * rx with the peer's RX map (the bitrate limit applies to it, as
+		 * since ath12k commit 9c5f229b1312) and tx with its TX map.
+		 * Change one side only and the firmware sees the maps reversed.
+		 * (VHT above keeps ath12k's own swap.)
+		 */
+		he_mcs->rx_mcs_set = param->peer_he_rx_mcs_set[i];
+		he_mcs->tx_mcs_set = param->peer_he_tx_mcs_set[i];
 		ptr = (uint8_t *)ptr + sizeof(*he_mcs);
 	}
 
@@ -22113,6 +22135,166 @@ qwz_mac_setup_ht_vht_cap(struct qwz_softc *sc, struct qwz_pdev *pdev)
 	    (ic->ic_flags & IEEE80211_F_VHTON) ? "" : " (disabled: -novht)");
 }
 
+/* ath12k_gen_ppe_thresh(): the firmware's PPE thresholds as the HE capabilities element carries them. */
+void
+qwz_gen_ppe_thresh(struct ath12k_ppe_threshold *fw_ppet, uint8_t *he_ppet)
+{
+	uint32_t numss_m1 = fw_ppet->numss_m1;
+	uint32_t nss;
+	int ru, i;
+	uint8_t bit = 7;
+
+	/* The firmware's value indexes ppet16_ppet8_ru3_ru0[8]; never trust it past that. */
+	if (numss_m1 > PSOC_HOST_MAX_NUM_SS - 1)
+		numss_m1 = PSOC_HOST_MAX_NUM_SS - 1;
+
+	he_ppet[0] = numss_m1 & IEEE80211_PPE_THRES_NSS_MASK;
+	he_ppet[0] |= (fw_ppet->ru_bit_mask <<
+	    IEEE80211_PPE_THRES_RU_INDEX_BITMASK_POS) &
+	    IEEE80211_PPE_THRES_RU_INDEX_BITMASK_MASK;
+	for (nss = 0; nss <= numss_m1; nss++) {
+		for (ru = 0; ru < 4; ru++) {
+			uint8_t val;
+
+			if ((fw_ppet->ru_bit_mask & BIT(ru)) == 0)
+				continue;
+			val = (fw_ppet->ppet16_ppet8_ru3_ru0[nss] >> (ru * 6)) &
+			    0x3f;
+			val = (uint8_t)(((val >> 3) & 0x7) | ((val & 0x7) << 3));
+			for (i = 5; i >= 0; i--) {
+				he_ppet[bit / 8] |= (uint8_t)
+				    (((val >> i) & 0x1) << ((bit % 8)));
+				bit++;
+			}
+		}
+	}
+}
+
+/*
+ * macOS: the station's 802.11ax capabilities, built from the firmware's HE
+ * capabilities the way ath12k_mac_copy_he_cap() (NL80211_IFTYPE_STATION),
+ * ath12k_mac_set_hemcsmap() and ath12k_gen_ppe_thresh() build them for
+ * mac80211.  net80211 sends them in the association request.
+ *
+ * OFF unless the itlwm_he=1 boot-arg left IEEE80211_F_HEON in ic_userflags
+ * (AirportItlwm::start): without it this returns before touching net80211,
+ * so no C_HE, no MODE_11AX in ic_modecaps and no HE element in the
+ * association request.  Called before ieee80211_channel_init (which adds
+ * MODE_11AX/C_HE when HEON is set) and again after qwz_mac_setup_ht_vht_cap.
+ *
+ * First build, deliberately narrower than ath12k: no TWT (not even the
+ * requester bit ath12k sets), no 160 MHz, no 80+80, 80 MHz maps only.
+ * The stream count is popcount(chain mask): sc->num_tx_chains is only set
+ * later, in qwz_set_antenna().
+ */
+void
+qwz_mac_setup_he_cap(struct qwz_softc *sc, struct qwz_pdev *pdev)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ath12k_pdev_cap *cap = &pdev->cap;
+	struct ath12k_band_cap *band = NULL, *band2g = NULL;
+	struct ieee80211_he_cap_elem *he = &ic->ic_he_cap_elem;
+	uint16_t txmcs_map = 0, rxmcs_map = 0;
+	int i, ntx, nrx;
+
+	if ((ic->ic_userflags & IEEE80211_F_HEON) == 0)
+		return;
+
+	/* 5 GHz caps as the base (the superset); the 2 GHz band adds 40 MHz in 2G. */
+	if (cap->supported_bands & WMI_HOST_WLAN_5G_CAP) {
+		band = &cap->band[1];
+		if (cap->supported_bands & WMI_HOST_WLAN_2G_CAP)
+			band2g = &cap->band[0];
+	} else if (cap->supported_bands & WMI_HOST_WLAN_2G_CAP)
+		band = &cap->band[0];
+
+	if (band == NULL || (band->he_cap_info[0] == 0 &&
+	    band->he_cap_info[1] == 0 && band->he_cap_phy_info[0] == 0 &&
+	    band->he_cap_phy_info[1] == 0 && band->he_cap_phy_info[2] == 0)) {
+		qwz_log("%s: 802.11ax: firmware reports no HE capabilities "
+		    "(bands 0x%x); HE stays off\n", sc->sc_dev.dv_xname,
+		    cap->supported_bands);
+		return;
+	}
+
+	ntx = (int)hweight32(cap->tx_chain_mask);
+	nrx = (int)hweight32(cap->rx_chain_mask);
+	if (ntx < 1)
+		ntx = 1;
+	if (nrx < 1)
+		nrx = 1;
+
+	/* ath12k_mac_copy_he_cap() */
+	memset(he, 0, sizeof(*he));
+	memcpy(he->mac_cap_info, band->he_cap_info, sizeof(he->mac_cap_info));
+	memcpy(he->phy_cap_info, band->he_cap_phy_info,
+	    sizeof(he->phy_cap_info));
+	if (band2g != NULL)
+		he->phy_cap_info[0] |=
+		    ((const uint8_t *)band2g->he_cap_phy_info)[0] &
+		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+
+	he->mac_cap_info[1] &= IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_MASK;
+	he->phy_cap_info[0] &=
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+	/* 80PLUS80 is not supported */
+	he->phy_cap_info[0] &=
+	    ~IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G;
+	he->phy_cap_info[5] &=
+	    ~IEEE80211_HE_PHY_CAP5_BEAMFORMEE_NUM_SND_DIM_UNDER_80MHZ_MASK;
+	he->phy_cap_info[5] |= ntx - 1;
+
+	/* NL80211_IFTYPE_STATION; ath12k also sets TWT_REQ here, off for now. */
+	he->mac_cap_info[0] &= ~(IEEE80211_HE_MAC_CAP0_TWT_RES |
+	    IEEE80211_HE_MAC_CAP0_TWT_REQ);
+	he->phy_cap_info[9] |=
+	    IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU;
+
+	/* First build: no 160 MHz (ath12k advertises it where the firmware does). */
+	he->phy_cap_info[0] &=
+	    ~IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+
+	/* ath12k_mac_set_hemcsmap(): MCS 0-11 per chain; no 160 / 80+80 maps. */
+	for (i = 0; i < 8; i++) {
+		txmcs_map |= (i < ntx ? IEEE80211_HE_MCS_SUPPORT_0_11 :
+		    IEEE80211_HE_MCS_NOT_SUPPORTED) << (i * 2);
+		rxmcs_map |= (i < nrx ? IEEE80211_HE_MCS_SUPPORT_0_11 :
+		    IEEE80211_HE_MCS_NOT_SUPPORTED) << (i * 2);
+	}
+	ic->ic_he_mcs_nss_supp.rx_mcs_80 = htole16(rxmcs_map);
+	ic->ic_he_mcs_nss_supp.tx_mcs_80 = htole16(txmcs_map);
+	ic->ic_he_mcs_nss_supp.rx_mcs_160 = htole16(0xffff);
+	ic->ic_he_mcs_nss_supp.tx_mcs_160 = htole16(0xffff);
+	ic->ic_he_mcs_nss_supp.rx_mcs_80p80 = htole16(0xffff);
+	ic->ic_he_mcs_nss_supp.tx_mcs_80p80 = htole16(0xffff);
+
+	memset(ic->ic_ppe_thres, 0, sizeof(ic->ic_ppe_thres));
+	if (he->phy_cap_info[6] & IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT)
+		qwz_gen_ppe_thresh(&band->he_ppet, ic->ic_ppe_thres);
+
+	ic->ic_flags |= IEEE80211_F_HEON;
+
+	qwz_log("%s: 802.11ax: fw bands 0x%x he mac 0x%x/0x%x phy 0x%x/0x%x/0x%x "
+	    "mcs5g 0x%x ppet nss-1 %u ru 0x%x svc11ax %d -> mac %02x%02x%02x%02x%02x%02x "
+	    "phy %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x mcs rx 0x%04x tx 0x%04x, "
+	    "%d tx / %d rx chains, no TWT/160\n", sc->sc_dev.dv_xname,
+	    cap->supported_bands, band->he_cap_info[0], band->he_cap_info[1],
+	    band->he_cap_phy_info[0], band->he_cap_phy_info[1],
+	    band->he_cap_phy_info[2], cap->he_mcs, band->he_ppet.numss_m1,
+	    band->he_ppet.ru_bit_mask,
+	    isset(sc->wmi.svc_map, WMI_TLV_SERVICE_11AX) ? 1 : 0,
+	    he->mac_cap_info[0], he->mac_cap_info[1], he->mac_cap_info[2],
+	    he->mac_cap_info[3], he->mac_cap_info[4], he->mac_cap_info[5],
+	    he->phy_cap_info[0], he->phy_cap_info[1], he->phy_cap_info[2],
+	    he->phy_cap_info[3], he->phy_cap_info[4], he->phy_cap_info[5],
+	    he->phy_cap_info[6], he->phy_cap_info[7], he->phy_cap_info[8],
+	    he->phy_cap_info[9], he->phy_cap_info[10],
+	    le16toh(ic->ic_he_mcs_nss_supp.rx_mcs_80),
+	    le16toh(ic->ic_he_mcs_nss_supp.tx_mcs_80), ntx, nrx);
+}
+
 int
 qwz_mac_op_start(struct qwz_pdev *pdev)
 {
@@ -22179,6 +22361,7 @@ qwz_mac_op_start(struct qwz_pdev *pdev)
 		ic->ic_sup_mcs[3] = 0xff;	/* MCS 24-31 */
 
 	qwz_mac_setup_ht_vht_cap(sc, pdev);	/* macOS: 11ac */
+	qwz_mac_setup_he_cap(sc, pdev);		/* macOS: 11ax, only with itlwm_he=1 */
 
 	/* TODO: Do we need to enable ANI? */
 
@@ -22463,11 +22646,17 @@ qwz_vdev_width(struct qwz_vif *arvif)
 	case MODE_11AC_VHT80_2G:
 	case MODE_11AC_VHT80_80:
 	case MODE_11AC_VHT160:
+	case MODE_11AX_HE80:
+	case MODE_11AX_HE80_2G:
+	case MODE_11AX_HE80_80:
+	case MODE_11AX_HE160:
 		return 80;
 	case MODE_11NA_HT40:
 	case MODE_11NG_HT40:
 	case MODE_11AC_VHT40:
 	case MODE_11AC_VHT40_2G:
+	case MODE_11AX_HE40:
+	case MODE_11AX_HE40_2G:
 		return 40;
 	default:
 		return 20;
@@ -22580,6 +22769,43 @@ qwz_mac_vdev_chan_args(struct qwz_softc *sc, struct ieee80211_node *ni,
 		arg->channel.mode = MODE_11G;
 	else
 		arg->channel.mode = MODE_11B;
+
+	/*
+	 * macOS: an HE BSS (qwz_auth decided from the scan-time elements, so
+	 * only with itlwm_he=1 and debug.qwz.he=1) starts the vdev in the HE
+	 * phy mode of the width chosen above, centre frequencies unchanged.
+	 * ath12k starts station vdevs in an HE/EHT mode whatever the AP runs;
+	 * a peer may still end up VHT on an HE vdev.
+	 */
+	if (sc->sc_vif.he_bss && arg->channel.allow_ht) {
+		switch (arg->channel.mode) {
+		case MODE_11AC_VHT80:
+			arg->channel.mode = MODE_11AX_HE80;
+			break;
+		case MODE_11AC_VHT40:
+		case MODE_11NA_HT40:
+			arg->channel.mode = MODE_11AX_HE40;
+			break;
+		case MODE_11AC_VHT20:
+		case MODE_11NA_HT20:
+			arg->channel.mode = MODE_11AX_HE20;
+			break;
+		case MODE_11NG_HT40:
+			arg->channel.mode = MODE_11AX_HE40_2G;
+			break;
+		case MODE_11NG_HT20:
+			arg->channel.mode = MODE_11AX_HE20_2G;
+			break;
+		default:
+			break;
+		}
+		if (arg->channel.mode >= MODE_11AX_HE20 &&
+		    arg->channel.mode <= MODE_11AX_HE80_2G) {
+			arg->channel.allow_he = true;
+			if (IEEE80211_IS_CHAN_5GHZ(chan))
+				arg->channel.allow_vht = true;
+		}
+	}
 }
 
 int
@@ -25137,6 +25363,22 @@ qwz_auth(struct qwz_softc *sc)
 	    ni->ni_chan->ic_center_freq1, ni->ni_rx_nss);
 
 	/*
+	 * HE: start the vdev in an HE phy mode when the BSS will be HE.  Not
+	 * ieee80211_he_negotiate() here (it needs NODE_QOS and ni_he_requested,
+	 * which only the association response provides): the scan-time HE
+	 * elements plus the same test the association request uses.  Always
+	 * false without itlwm_he=1 (HEON is never set) or with debug.qwz.he=0.
+	 */
+	arvif->he_bss = (ic->ic_flags & IEEE80211_F_HEON) &&
+	    (ni->ni_flags & IEEE80211_NODE_HT) &&
+	    ieee80211_he_supported(ic, ni);
+	if (ic->ic_flags & IEEE80211_F_HEON)
+		qwz_log("%s: HE: bss %s chan %d flags 0x%x chw %d -> vdev %s\n",
+		    sc->sc_dev.dv_xname, ether_sprintf(ni->ni_bssid),
+		    ieee80211_chan2ieee(ic, ni->ni_chan), ni->ni_flags,
+		    ni->ni_chw, arvif->he_bss ? "HE" : "HT/VHT");
+
+	/*
 	 * Start vdev BEFORE creating the peer.  Linux ath12k starts the
 	 * vdev at chanctx-assignment time, well before any PEER_CREATE.
 	 * If we instead PEER_CREATE first, the FW creates the peer entry
@@ -25305,7 +25547,18 @@ qwz_peer_assoc_h_phymode(struct qwz_softc *sc, struct ieee80211_node *ni,
 	}
 
 	/* ath12k_peer_assoc_h_phymode(), from what net80211 negotiated. */
-	if (ni->ni_flags & IEEE80211_NODE_VHT) {
+	if (ni->ni_flags & IEEE80211_NODE_HE) {
+		/* Only with itlwm_he=1: NODE_HE comes from he_negotiate(). */
+		if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))
+			phymode = width >= 40 ? MODE_11AX_HE40_2G :
+			    MODE_11AX_HE20_2G;
+		else if (width >= 80)
+			phymode = MODE_11AX_HE80;
+		else if (width >= 40)
+			phymode = MODE_11AX_HE40;
+		else
+			phymode = MODE_11AX_HE20;
+	} else if (ni->ni_flags & IEEE80211_NODE_VHT) {
 		if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))
 			phymode = width >= 40 ? MODE_11AC_VHT40 :
 			    MODE_11AC_VHT20;
@@ -25333,7 +25586,27 @@ qwz_peer_assoc_h_phymode(struct qwz_softc *sc, struct ieee80211_node *ni,
 			phymode = MODE_11G;
 			break;
 		default:
-			phymode = MODE_UNKNOWN;
+			/*
+			 * ath12k never sends MODE_UNKNOWN: a non-HT peer is
+			 * 11a on 5 GHz and 11g on 2.4 GHz (11b if it has no
+			 * OFDM rate).  The mode can still be AUTO/11n/11ac
+			 * here, before the association response set it.
+			 */
+			if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+				phymode = MODE_11A;
+			else {
+				int i;
+
+				phymode = MODE_11B;
+				for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
+					if (!qwz_mac_rate_is_cck(
+					    ni->ni_rates.rs_rates[i] &
+					    IEEE80211_RATE_VAL)) {
+						phymode = MODE_11G;
+						break;
+					}
+				}
+			}
 			break;
 		}
 	}
@@ -25531,6 +25804,291 @@ qwz_peer_assoc_h_vht(struct qwz_softc *sc, struct ieee80211_node *ni,
 	    arg->tx_mcs_set, arg->bw_80);
 }
 
+/* ath12k_mac_get_max_he_mcs_map() */
+uint16_t
+qwz_mac_get_max_he_mcs_map(uint16_t mcs_map, int nss)
+{
+	switch ((mcs_map >> (2 * nss)) & 0x3) {
+	case IEEE80211_HE_MCS_SUPPORT_0_7:
+		return BIT(8) - 1;
+	case IEEE80211_HE_MCS_SUPPORT_0_9:
+		return BIT(10) - 1;
+	case IEEE80211_HE_MCS_SUPPORT_0_11:
+		return BIT(12) - 1;
+	}
+	return 0;
+}
+
+/* ath12k_peer_assoc_h_he_limit() */
+uint16_t
+qwz_peer_assoc_h_he_limit(uint16_t tx_mcs_set, const uint16_t *he_mcs_limit)
+{
+	int idx_limit, nss;
+	uint16_t mcs_map, mcs;
+
+	for (nss = 0; nss < 8; nss++) {
+		mcs_map = qwz_mac_get_max_he_mcs_map(tx_mcs_set, nss) &
+		    he_mcs_limit[nss];
+
+		if (mcs_map)
+			idx_limit = fls(mcs_map) - 1;
+		else
+			idx_limit = -1;
+
+		switch (idx_limit) {
+		case 0 ... 7:
+			mcs = IEEE80211_HE_MCS_SUPPORT_0_7;
+			break;
+		case 8:
+		case 9:
+			mcs = IEEE80211_HE_MCS_SUPPORT_0_9;
+			break;
+		case 10:
+		case 11:
+			mcs = IEEE80211_HE_MCS_SUPPORT_0_11;
+			break;
+		default:
+			/* FALLTHROUGH */
+		case -1:
+			mcs = IEEE80211_HE_MCS_NOT_SUPPORTED;
+			break;
+		}
+
+		tx_mcs_set &= ~(0x3 << (nss * 2));
+		tx_mcs_set |= mcs << (nss * 2);
+	}
+
+	return tx_mcs_set;
+}
+
+/*
+ * ath12k_peer_assoc_h_he(), from the AP's HE elements in the node (ni_he_*,
+ * parsed from the association response) and the width/NSS net80211 settled
+ * on.  Does nothing unless he_negotiate() set NODE_HE, so qwz_assoc()'s
+ * pre-association peer assoc stays HT/VHT and qwz_run()'s carries HE.
+ *
+ * Fills peer_he_rx_mcs_set with the peer's RX map and peer_he_tx_mcs_set with
+ * its TX map, as ath12k does (ni_he_mcs_nss_supp.rx_* is the AP's Rx map);
+ * qwz_wmi_send_peer_assoc_cmd() then writes them in that order (rx ->
+ * rx_mcs_set, tx -> tx_mcs_set), as current ath12k wmi.c does.  The fill
+ * and the writer are one change: do not alter one without the other.
+ *
+ * Not ported: the user bitrate mask (qwz has none; ath12k's default he_mcs
+ * mask is all ones, which makes ath12k_peer_assoc_h_he_limit() the identity
+ * and ath12k_mac_max_he_nss() 8), the HE160 NSS override (qwz never starts
+ * HE160), and ath12k_peer_assoc_h_he_6ghz()/smps (left off).
+ */
+void
+qwz_peer_assoc_h_he(struct qwz_softc *sc, struct ieee80211_node *ni,
+    struct peer_assoc_params *arg)
+{
+	uint16_t he_mcs_mask[8];	/* NL80211_HE_NSS_MAX; ath12k default */
+	uint8_t ampdu_factor, max_nss;
+	uint8_t rx_mcs_80 = IEEE80211_HE_MCS_NOT_SUPPORTED;
+	uint8_t rx_mcs_160 = IEEE80211_HE_MCS_NOT_SUPPORTED;
+	uint16_t mcs_160_map, mcs_80_map;
+	bool support_160;
+	uint8_t he_mcs;
+	uint16_t he_tx_mcs = 0, v = 0;
+	int i, he_nss, nss_idx, rx_nss;
+	bool user_rate_valid = true;
+
+	if ((ni->ni_flags & IEEE80211_NODE_HE) == 0)
+		return;
+
+	for (i = 0; i < (int)nitems(he_mcs_mask); i++)
+		he_mcs_mask[i] = 0xffff;
+
+	arg->he_flag = true;
+
+	/* link_sta->rx_nss; ath12k's is never 0 */
+	rx_nss = ni->ni_rx_nss != 0 ? ni->ni_rx_nss : 1;
+
+	support_160 = !!(ni->ni_he_cap_elem.phy_cap_info[0] &
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G);
+
+	/* Supported HE-MCS and NSS Set of peer he_cap is intersection with self he_cp */
+	mcs_160_map = le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_160);
+	mcs_80_map = le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_80);
+
+	if (support_160) {
+		for (i = 7; i >= 0; i--) {
+			uint8_t mcs_160 = (mcs_160_map >> (2 * i)) & 3;
+
+			if (mcs_160 != IEEE80211_HE_MCS_NOT_SUPPORTED) {
+				rx_mcs_160 = (uint8_t)(i + 1);
+				break;
+			}
+		}
+	}
+
+	for (i = 7; i >= 0; i--) {
+		uint8_t mcs_80 = (mcs_80_map >> (2 * i)) & 3;
+
+		if (mcs_80 != IEEE80211_HE_MCS_NOT_SUPPORTED) {
+			rx_mcs_80 = (uint8_t)(i + 1);
+			break;
+		}
+	}
+
+	if (support_160)
+		max_nss = MIN(rx_mcs_80, rx_mcs_160);
+	else
+		max_nss = rx_mcs_80;
+
+	arg->peer_nss = (uint32_t)MIN(rx_nss, (int)max_nss);
+
+	memcpy(&arg->peer_he_cap_macinfo, ni->ni_he_cap_elem.mac_cap_info,
+	    sizeof(ni->ni_he_cap_elem.mac_cap_info));
+	memcpy(&arg->peer_he_cap_phyinfo, ni->ni_he_cap_elem.phy_cap_info,
+	    sizeof(ni->ni_he_cap_elem.phy_cap_info));
+	arg->peer_he_ops = ni->ni_he_oper_params;
+
+	/* the top most byte is used to indicate BSS color info */
+	arg->peer_he_ops &= 0xffffff;
+
+	/*
+	 * As per section 26.6.1 IEEE Std 802.11ax-2022, if the Max AMPDU
+	 * Exponent Extension in HE cap is zero, use the arg->peer_max_mpdu
+	 * as calculated while parsing VHT caps (if VHT caps is present)
+	 * or HT caps (if VHT caps is not present).
+	 *
+	 * For non-zero value of Max AMPDU Exponent Extension in HE MAC caps,
+	 * if a HE STA sends VHT cap and HE cap IE in assoc request then, use
+	 * MAX_AMPDU_LEN_FACTOR as 20 to calculate max_ampdu length.
+	 * If a HE STA that does not send VHT cap, but HE and HT cap in assoc
+	 * request, then use MAX_AMPDU_LEN_FACTOR as 16 to calculate max_ampdu
+	 * length.
+	 */
+	ampdu_factor = (ni->ni_he_cap_elem.mac_cap_info[3] &
+	    IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_MASK) >>
+	    IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_SHIFT;
+
+	if (ampdu_factor) {
+		if (ni->ni_flags & IEEE80211_NODE_VHT)
+			arg->peer_max_mpdu = (1U <<
+			    (IEEE80211_HE_VHT_MAX_AMPDU_FACTOR +
+			    ampdu_factor)) - 1;
+		else if (ni->ni_flags & IEEE80211_NODE_HT)
+			arg->peer_max_mpdu = (1U <<
+			    (IEEE80211_HE_HT_MAX_AMPDU_FACTOR +
+			    ampdu_factor)) - 1;
+	}
+
+	if (ni->ni_he_cap_elem.phy_cap_info[6] &
+	    IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) {
+		int bit = 7;
+		uint32_t nss;
+		int ru;
+
+		arg->peer_ppet.numss_m1 = ni->ni_ppe_thres[0] &
+		    IEEE80211_PPE_THRES_NSS_MASK;
+		arg->peer_ppet.ru_bit_mask =
+		    (ni->ni_ppe_thres[0] &
+		    IEEE80211_PPE_THRES_RU_INDEX_BITMASK_MASK) >>
+		    IEEE80211_PPE_THRES_RU_INDEX_BITMASK_POS;
+
+		for (nss = 0; nss <= arg->peer_ppet.numss_m1; nss++) {
+			for (ru = 0; ru < 4; ru++) {
+				uint32_t val = 0;
+				int j;
+
+				if ((arg->peer_ppet.ru_bit_mask &
+				    BIT(ru)) == 0)
+					continue;
+				for (j = 0; j < 6; j++) {
+					val >>= 1;
+					val |= (uint32_t)((ni->ni_ppe_thres[bit / 8] >>
+					    (bit % 8)) & 0x1) << 5;
+					bit++;
+				}
+				arg->peer_ppet.ppet16_ppet8_ru3_ru0[nss] |=
+				    val << (ru * 6);
+			}
+		}
+	}
+
+	if (ni->ni_he_cap_elem.mac_cap_info[0] & IEEE80211_HE_MAC_CAP0_TWT_RES)
+		arg->twt_responder = true;
+	if (ni->ni_he_cap_elem.mac_cap_info[0] & IEEE80211_HE_MAC_CAP0_TWT_REQ)
+		arg->twt_requester = true;
+
+	/* ath12k_mac_max_he_nss(he_mcs_mask) */
+	he_nss = 1;
+	for (i = (int)nitems(he_mcs_mask) - 1; i >= 0; i--) {
+		if (he_mcs_mask[i]) {
+			he_nss = i + 1;
+			break;
+		}
+	}
+
+	if (he_nss > rx_nss) {
+		user_rate_valid = false;
+		for (nss_idx = rx_nss - 1; nss_idx >= 0; nss_idx--) {
+			if (he_mcs_mask[nss_idx]) {
+				user_rate_valid = true;
+				break;
+			}
+		}
+	}
+
+	if (!user_rate_valid)
+		he_mcs_mask[rx_nss - 1] = he_mcs_mask[he_nss - 1];
+
+	switch (ni->ni_chw) {
+	case IEEE80211_CHAN_WIDTH_160:
+	case IEEE80211_CHAN_WIDTH_80P80:
+		v = le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_160);
+		v = qwz_peer_assoc_h_he_limit(v, he_mcs_mask);
+		arg->peer_he_rx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_160] = v;
+
+		v = le16toh(ni->ni_he_mcs_nss_supp.tx_mcs_160);
+		arg->peer_he_tx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_160] = v;
+
+		arg->peer_he_mcs_count++;
+		if (!he_tx_mcs)
+			he_tx_mcs = v;
+		/* FALLTHROUGH */
+
+	default:
+		v = le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_80);
+		v = qwz_peer_assoc_h_he_limit(v, he_mcs_mask);
+		arg->peer_he_rx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_80] = v;
+
+		v = le16toh(ni->ni_he_mcs_nss_supp.tx_mcs_80);
+		arg->peer_he_tx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_80] = v;
+
+		arg->peer_he_mcs_count++;
+		if (!he_tx_mcs)
+			he_tx_mcs = v;
+		break;
+	}
+
+	/*
+	 * Calculate peer NSS capability from HE capabilities if STA
+	 * supports HE.
+	 */
+	for (i = 0, max_nss = 0, he_mcs = 0; i < (int)nitems(he_mcs_mask); i++) {
+		he_mcs = (he_tx_mcs >> (2 * i)) & 3;
+
+		/*
+		 * In case of fixed rates, MCS Range in he_tx_mcs might have
+		 * unsupported range, with he_mcs_mask set, so check either of
+		 * them to find nss.
+		 */
+		if (he_mcs != IEEE80211_HE_MCS_NOT_SUPPORTED ||
+		    he_mcs_mask[i])
+			max_nss = (uint8_t)(i + 1);
+	}
+
+	max_nss = (uint8_t)MIN((int)max_nss, (int)sc->num_tx_chains);
+	arg->peer_nss = (uint32_t)MIN(rx_nss, (int)max_nss);
+
+	DNPRINTF(QWZ_D_MAC, "%s: he peer %s nss %d mcs cnt %d\n", __func__,
+	    ether_sprintf(arg->peer_mac), arg->peer_nss,
+	    arg->peer_he_mcs_count);
+}
+
 void
 qwz_peer_assoc_h_qos(struct ieee80211_node *ni, struct peer_assoc_params *arg)
 {
@@ -25553,9 +26111,9 @@ qwz_peer_assoc_prepare(struct qwz_softc *sc, struct qwz_vif *arvif,
 	qwz_peer_assoc_h_phymode(sc, ni, arg);
 	qwz_peer_assoc_h_ht(sc, ni, arg);
 	qwz_peer_assoc_h_vht(sc, ni, arg);	/* macOS: 11ac */
+	qwz_peer_assoc_h_he(sc, ni, arg);	/* macOS: 11ax, only for NODE_HE */
 	qwz_peer_assoc_h_qos(ni, arg);
 #if 0
-	qwz_peer_assoc_h_he(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_he_6ghz(sc, arvif, ni, arg);
 	qwz_peer_assoc_h_smps(ni, arg);
 #endif
@@ -25783,6 +26341,45 @@ qwz_assoc(struct qwz_softc *sc)
 	return 0;
 }
 
+/*
+ * ath12k_mac_vif_recalc_sta_he_txbf(): the vdev's HE MU mode for a station
+ * associating to an HE AP.  Beamformee and UL MU-MIMO only where both sides
+ * support them; DL/UL OFDMA always.  ath12k's mesh-point exception is left
+ * out (a station is never one).
+ */
+uint32_t
+qwz_mac_recalc_sta_he_txbf(struct qwz_softc *sc, struct ieee80211_node *ni)
+{
+	const uint8_t *our = sc->sc_ic.ic_he_cap_elem.phy_cap_info;
+	const uint8_t *peer = ni->ni_he_cap_elem.phy_cap_info;
+	uint32_t hemode = 0;
+
+	if (HECAP_PHY_SUBFME_GET(our)) {
+		if (HECAP_PHY_SUBFMR_GET(peer))
+			hemode |= FIELD_PREP(HE_MODE_SU_TX_BFEE,
+			    HE_SU_BFEE_ENABLE);
+		if (HECAP_PHY_MUBFMR_GET(peer))
+			hemode |= FIELD_PREP(HE_MODE_MU_TX_BFEE,
+			    HE_MU_BFEE_ENABLE);
+	}
+
+	hemode |= FIELD_PREP(HE_MODE_DL_OFDMA, HE_DL_MUOFDMA_ENABLE) |
+	    FIELD_PREP(HE_MODE_UL_OFDMA, HE_UL_MUOFDMA_ENABLE);
+
+	if (HECAP_PHY_ULMUMIMO_GET(our))
+		if (HECAP_PHY_ULMUMIMO_GET(peer))
+			hemode |= FIELD_PREP(HE_MODE_UL_MUMIMO,
+			    HE_UL_MUMIMO_ENABLE);
+
+	if (FIELD_GET(HE_MODE_MU_TX_BFEE, hemode))
+		hemode |= FIELD_PREP(HE_MODE_SU_TX_BFEE, HE_SU_BFEE_ENABLE);
+
+	if (FIELD_GET(HE_MODE_MU_TX_BFER, hemode))
+		hemode |= FIELD_PREP(HE_MODE_SU_TX_BFER, HE_SU_BFER_ENABLE);
+
+	return hemode;
+}
+
 int
 qwz_run(struct qwz_softc *sc)
 {
@@ -25816,6 +26413,39 @@ qwz_run(struct qwz_softc *sc)
 	}
 
 	qwz_peer_assoc_prepare(sc, arvif, ni, &peer_arg, 1);
+
+	/*
+	 * macOS: HE MU mode, before the peer assoc as ath12k_bss_assoc() does
+	 * ("keep this before ath12k_wmi_send_peer_assoc_cmd()").  Only for an
+	 * HE link (NODE_HE, set by the association response): qwz_assoc()'s
+	 * pre-association 0 stays as it is, and without itlwm_he=1 nothing
+	 * is sent here.
+	 */
+	if (ni->ni_flags & IEEE80211_NODE_HE) {
+		uint32_t hemode = qwz_mac_recalc_sta_he_txbf(sc, ni);
+
+		qwz_log("%s: HE assoc: peer %s phymode %s nss %u chw %d "
+		    "he mcs cnt %u rx 0x%04x/0x%04x tx 0x%04x/0x%04x "
+		    "hemode 0x%x max_mpdu %u ops 0x%x twt req %d resp %d\n",
+		    sc->sc_dev.dv_xname, ether_sprintf(ni->ni_macaddr),
+		    qwz_wmi_phymode_str((enum wmi_phy_mode)peer_arg.peer_phymode),
+		    peer_arg.peer_nss, ni->ni_chw, peer_arg.peer_he_mcs_count,
+		    peer_arg.peer_he_rx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_80],
+		    peer_arg.peer_he_rx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_160],
+		    peer_arg.peer_he_tx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_80],
+		    peer_arg.peer_he_tx_mcs_set[WMI_HECAP_TXRX_MCS_NSS_IDX_160],
+		    hemode, peer_arg.peer_max_mpdu, peer_arg.peer_he_ops,
+		    peer_arg.twt_requester, peer_arg.twt_responder);
+
+		ret = qwz_wmi_vdev_set_param_cmd(sc, arvif->vdev_id, pdev_id,
+		    WMI_VDEV_PARAM_SET_HEMU_MODE, hemode);
+		if (ret) {
+			printf("%s: failed to submit vdev param "
+			    "SET_HEMU_MODE 0x%x: %d\n", sc->sc_dev.dv_xname,
+			    hemode, ret);
+			return ret;
+		}
+	}
 
 	peer_arg.is_assoc = 1;
 

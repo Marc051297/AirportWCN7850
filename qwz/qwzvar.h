@@ -1862,6 +1862,11 @@ struct qwz_vif {
 	/* Channel mode and centre the vdev was last (re)started with. */
 	uint32_t chan_mode;
 	uint32_t chan_cfreq1;
+	/*
+	 * The BSS advertised HE at scan time and HE is allowed (itlwm_he=1,
+	 * debug.qwz.he): the vdev starts in an HE phy mode.  Set in qwz_auth.
+	 */
+	bool he_bss;
 #endif
 #if 0
 	struct ath12k_arp_ns_offload arp_ns_offload;

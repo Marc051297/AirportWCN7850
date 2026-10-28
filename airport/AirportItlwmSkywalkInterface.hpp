@@ -198,7 +198,7 @@ public:
     virtual IOReturn getHOST_AP_MODE_HIDDEN(apple80211_host_ap_mode_hidden_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getLQM_CONFIG(apple80211_lqm_config_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTRAP_CRASHTRACER_MINI_DUMP(apple80211_trap_mini_dump_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getHE_CAPABILITY(apple80211_he_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getHE_CAPABILITY(apple80211_he_capability *) AIRPORT_SKYWALK_OVERRIDE;	/* still unsupported; logs the first ask */
 #ifdef AIRPORT_WCL
     IOReturn getBEACON_INFO(apple80211_beacon_info_t *) override;
 #else
@@ -209,7 +209,7 @@ public:
     virtual IOReturn getSOFTAP_STATS(apple80211_softap_stats *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getNSS(apple80211_nss_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getHW_ADDR(apple80211_hw_mac_address *) AIRPORT_SKYWALK_OVERRIDE;
-    virtual IOReturn getHE_MCS_INDEX_SET(apple80211_he_mcs_index_set_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getHE_MCS_INDEX_SET(apple80211_he_mcs_index_set_data *) AIRPORT_SKYWALK_OVERRIDE;	/* still unsupported; logs the first ask */
     virtual IOReturn getCHIP_DIAGS(appl80211_chip_diags_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getHP2P_CTRL(apple80211_hp2p_ctrl *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getREQUEST_BSS_BLACKLIST(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }

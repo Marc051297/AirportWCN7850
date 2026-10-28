@@ -67,6 +67,7 @@ From the terminal, with the driver idle:
 | `scripts/qwz-log.sh [lines]` | republish and print the in-memory log ring (`QwzMacLog` on the PCI device in the I/O Registry) |
 | `sysctl debug.qwz.debug=<mask>` | qwz trace mask (`QWZ_D_*` in `qwz/qwzvar.h`; 0x1 misc, 0x8 WMI, 0x40 MAC, 0x80 mgmt) |
 | `sysctl debug.qwz.logfile=1` | also append every line to `/private/var/log/qwzmac.log`, fully synced, so the last line survives a hard freeze |
+| `sysctl debug.qwz.he=0` | no 802.11ax for the next association (default 1). It can only turn HE off: HE exists at all only with the `itlwm_he=1` boot-arg (AirportWCN7850.kext) |
 | `sudo dmesg \| grep qwz` | the same lines from the kernel buffer |
 
 The `debug.qwz.*` sysctls are registered by both kexts (`qwz/qwz_sysctl.cpp`), so `scripts/qwz-log.sh`, `debug.qwz.logfile` and the trace mask also work with `AirportWCN7850.kext`. Only `debug.qwz.start` is QwzMac-only: the Airport product has no idle bring-up to rerun and answers `ENXIO`.

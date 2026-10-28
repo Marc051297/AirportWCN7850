@@ -7,6 +7,8 @@
  *   debug.qwz.stage=<n>   stop the next bring-up before stage n (-1: boot-time limit)
  *   debug.qwz.start=1     rerun the bring-up; only where the product passes a callback
  *   debug.qwz.debug=<m>   qwz trace mask, debug builds (QWZ_D_* in qwzvar.h)
+ *   debug.qwz.he=0        no 802.11ax for the next association (default 1; can only turn
+ *                         HE off, it exists at all only with the itlwm_he=1 boot-arg)
  *
  * Copyright (c) 2026 razvanccr. GPL-2.0-or-later (see LICENSE).
  */

@@ -820,9 +820,14 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     XYLog("%s chan_width=%s support_160=%d support_80_80=%d\n", __FUNCTION__, ieee80211_chan_width_name[ni->ni_chw], support_160, support_80_80);
 }
 
+/* debug.qwz.he (qwz/qwz_sysctl.cpp): 0 turns HE off for the next association; it can never turn it on. */
+extern int qwz_he_sysctl;
+
 int
 ieee80211_he_supported(struct ieee80211com *ic, struct ieee80211_node *ni)
 {
+    if (!qwz_he_sysctl)
+        return 0;
     if (!(ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)) ||
         !(ic->ic_flags & IEEE80211_F_HEON) ||
         (ic->ic_userflags & IEEE80211_F_NOVHT) ||
@@ -885,7 +890,23 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
         width_ok = (widths & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) &&
             (tx160 & 3) != 3 && (rx160 & 3) != 3;
     }
-    if (!width_ok) {
+    if (!width_ok && ni->ni_chw == IEEE80211_CHAN_WIDTH_160 &&
+        IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+        ni->ni_chan->ic_center_freq1 != 0 &&
+        (widths & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G)) {
+        /*
+         * The AP runs 160 MHz but we do not share it: operate on the 80 MHz
+         * half that holds the primary channel instead of dropping to 20 MHz.
+         * ic_center_freq1 is the centre of the 160 MHz block here; the 80 MHz
+         * centre is 40 MHz below or above it (same rule as qwz_mac_vdev_chan_args).
+         */
+        uint16_t cf160 = ni->ni_chan->ic_center_freq1;
+
+        ni->ni_chw = IEEE80211_CHAN_WIDTH_80;
+        ni->ni_chan->ic_center_freq1 = ni->ni_chan->ic_freq > cf160 ?
+            cf160 + 40 : cf160 - 40;
+        ni->ni_chan->ic_center_freq2 = 0;
+    } else if (!width_ok) {
         ni->ni_chw = IEEE80211_CHAN_WIDTH_20;
         ni->ni_chan->ic_center_freq1 = ni->ni_chan->ic_freq;
         ni->ni_chan->ic_center_freq2 = 0;
