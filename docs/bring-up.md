@@ -95,7 +95,7 @@ A kernel driver bug panics the whole machine, and this one has not run on hardwa
    sudo nvram boot-args="$(nvram -p | awk -F'\t' '/^boot-args/{print $2}') -qwzoff"
    ```
 
-3. **Don't let the Mac sleep** during the first tests: sleep/wake is wired in AirportWCN7850 (chip power-down on sleep, link/config recovery and full firmware re-init on wake; boot-arg -qwznowakefix restores the old behaviour); QwzMac still has no sleep support.
+3. **Don't let the Mac sleep** during the first tests: sleep/wake is wired in AirportWCN7850 (chip power-down on sleep, link/config recovery and full firmware re-init on wake; boot-arg -qwznowakefix restores the old behaviour). Wi-Fi off/on does the same chip reset (`-qwznoradioreset` turns that off), and a data-stall restart reloads the firmware when the link sat in RUN for 10 s without one data frame (`-qwznostallfix` turns it off, `-qwzstallsbr` makes the second restart also reset the PCIe link). QwzMac still has no sleep support.
 4. Do not install alongside **itlwm**: both register a class named `itlwm` (that is how HeliPort finds the driver).
 
 ### Install

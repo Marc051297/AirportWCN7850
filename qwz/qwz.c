@@ -24814,6 +24814,7 @@ qwz_mac_station_remove(struct qwz_softc *sc, struct qwz_vif *arvif,
 
 	ret = qwz_peer_delete(sc, arvif->vdev_id, pdev_id, peer);
 	if (ret) {
+		sc->sc_peer_del_fail++;
 		printf("%s: unable to delete BSS peer: %d\n",
 		   sc->sc_dev.dv_xname, ret);
 		return ret;

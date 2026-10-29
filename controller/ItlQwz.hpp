@@ -52,10 +52,14 @@ public:
 	bool initWithController(IOEthernetController *controller, IOWorkLoop *workloop, IOCommandGate *commandGate) override;
 	void shutdownHardware() override;
 	static IOReturn shutdownGated(OSObject *, void *, void *, void *, void *);
+	void sleepQuiesce(uint32_t maxMs) override;
+	bool firmwareUp() override;
 	void sleepHardware() override;
 	bool wakeNeedsRecovery() override;
 	IOReturn wakeHardware() override;
 	void wakeComplete(bool ok) override;
+	bool dataStalled(bool *healthy) override;
+	void requestBusReset() override;
 	IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
 #ifdef AIRPORT_WCL
 	IOReturn setScanHomeAwayTime(uint32_t ms) override;
@@ -66,6 +70,8 @@ private:
 	static IOReturn detachGated(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn enableGated(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn disableGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn sleepQuiesceGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn stallCheckGated(OSObject *owner, void *, void *, void *, void *);
 
 	/*
 	 * The softc exists from initWithController() on, so get80211Controller()
@@ -93,6 +99,32 @@ private:
 	IOPCIDevice *parentBridge(IOService **bus);
 	bool soleDeviceBehind(IOService *bus);
 	void saveConfig();
+
+	/* Sleep ordering: peer delete failures counted when the sleep began (sleepQuiesce). */
+	uint32_t sleepFailBase;
+	bool sleepBaseValid;
+	/* The teardown before the last sleep left a peer behind or failed to delete one. */
+	bool dirtyTeardown;
+	bool busResetNext;	/* requestBusReset(): wakeHardware() does an SBR even though the device answers */
+
+	/*
+	 * Data-stall watch (dataStalled): RUN time without a single data frame,
+	 * added up over consecutive associations, and the management frames that
+	 * arrived since the episode began. A data frame shows the data path works
+	 * and ends the episode; a new firmware (wakeComplete) starts it afresh.
+	 */
+	struct {
+		bool valid;		/* data/mgmt/lastMs hold a sample */
+		bool inRun;		/* the last sample was in RUN */
+		bool periodData;	/* a data frame arrived in this RUN period */
+		bool logged;		/* the detection was logged for this episode */
+		uint32_t data, mgmt;	/* sc_probe_data_seen / sc_probe_mgmt_seen at the last sample */
+		uint32_t runMs;		/* RUN time without a data frame */
+		uint32_t mgmtIn;	/* management frames received in this episode */
+		uint64_t lastMs;
+		uint64_t lastRunMs;	/* last time in RUN (or the first sample): evidence older than a minute is dropped */
+		uint32_t healthyMs;	/* RUN time with data seen, consecutive */
+	} stall;
 };
 
 #endif /* ItlQwz_hpp */

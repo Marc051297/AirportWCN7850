@@ -2119,6 +2119,7 @@ struct qwz_softc {
 	uint32_t			free_vdev_map;
 	struct qwz_peer_list		peers;
 	int				num_peers;
+	uint32_t			sc_peer_del_fail;	/* qwz_mac_station_remove failures; the sleep path compares it */
 	int				bss_peer_id;
 	int				peer_mapped;
 	int				peer_delete_done;

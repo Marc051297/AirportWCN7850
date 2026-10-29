@@ -196,6 +196,10 @@ ItlQwz::detachGated(OSObject *, void *arg0, void *, void *, void *)
 		that->sc = NULL;
 	}
 	that->attached = false;
+	that->dirtyTeardown = false;
+	that->sleepBaseValid = false;
+	that->busResetNext = false;
+	bzero(&that->stall, sizeof(that->stall));
 	return kIOReturnSuccess;
 }
 
@@ -317,32 +321,137 @@ ItlQwz::saveConfig()
 	saved.valid = true;
 }
 
+/*
+ * In-flight state work: every queued or running net80211 state, set-key or
+ * block-ack task holds a task_refs reference (the base reference is 1), the
+ * init task is only queued, and a thread inside qwz_init/qwz_stop owns the
+ * ioctl lock.
+ */
+static int
+qwz_state_work(struct qwz_softc *sc, int *tasks, int *initq, int *lock)
+{
+	*tasks = sc->task_refs.r_refs > 1 ? sc->task_refs.r_refs - 1 : 0;
+	*initq = task_pending(&sc->init_task) != 0;
+	*lock = sc->ioctl_rwl.rwl_owner != NULL;
+	return *tasks != 0 || *initq || *lock;
+}
+
+#define QWZ_QUIESCE_POLL_MS	10
+
+/*
+ * Sleep ordering. A leave-network request from airportd runs a RUN -> SCAN
+ * change in the state task: vdev down, vdev stop, peer delete, REO queue
+ * retirement, each a WMI round trip with the gate released. qwz_stop() then
+ * set CRASH_FLUSH ("disallow new tasks") under it, the peer delete failed
+ * with ESHUTDOWN and the BSS peer stayed half deleted. Let that work finish
+ * first (it takes tens of milliseconds); qwz_stop() then finds the
+ * association torn down in order.
+ */
+IOReturn
+ItlQwz::sleepQuiesceGated(OSObject *, void *arg0, void *arg1, void *, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller */
+	uint32_t maxMs = (uint32_t)(uintptr_t)arg1;
+	struct qwz_softc *sc = that->sc;
+	IOWorkLoop *wl = qwz_hal_gate->getWorkLoop();
+	uint64_t t0 = qwz_pm_ms(), waited;
+	int tasks, initq, lock, t, i, l;
+
+	that->sleepFailBase = sc->sc_peer_del_fail;
+	that->sleepBaseValid = true;
+	if (wl != NULL && wl->onThread()) {
+		qwz_log("qwz: pm: sleep: on the workloop thread: not waiting for in-flight state work\n");
+		return kIOReturnSuccess;
+	}
+	if (!qwz_state_work(sc, &tasks, &initq, &lock)) {
+		qwz_log("qwz: pm: sleep: waited 0 ms for in-flight state work (none)\n");
+		return kIOReturnSuccess;
+	}
+	/* The gate is released while asleep: the tasks need it to finish. */
+	while ((waited = qwz_pm_ms() - t0) < maxMs && qwz_state_work(sc, &t, &i, &l))
+		tsleep_nsec(that, 0, "qwzquiesce", MSEC_TO_NSEC(QWZ_QUIESCE_POLL_MS));
+	if (qwz_state_work(sc, &t, &i, &l))
+		qwz_log("qwz: pm: sleep: waited %llu ms for in-flight state work and gave up: %d task(s), init task %d, ioctl lock %d; stopping anyway\n",
+		    qwz_pm_ms() - t0, t, i, l);
+	else
+		qwz_log("qwz: pm: sleep: waited %llu ms for in-flight state work (%d state/key/BA task(s), init task %d, ioctl lock %d at the start)\n",
+		    qwz_pm_ms() - t0, tasks, initq, lock);
+	return kIOReturnSuccess;
+}
+
+void
+ItlQwz::sleepQuiesce(uint32_t maxMs)
+{
+	if (!attached || shutdown || sc == NULL || qwz_hal_gate == NULL)
+		return;
+	qwz_hal_gate->runAction(sleepQuiesceGated, this, (void *)(uintptr_t)maxMs);
+	qwz_log_publish();
+}
+
+bool
+ItlQwz::firmwareUp()
+{
+	return attached && !shutdown && sc != NULL && sc->fw_initialized;
+}
+
 void
 ItlQwz::sleepHardware()
 {
 	struct _ifnet *ifp;
 	uint64_t t0 = qwz_pm_ms();
+	uint32_t nfail;
 
 	if (!attached || shutdown || sc == NULL) {
 		qwz_log("qwz: pm: sleep: nothing to do (attached %d shutdown %d)\n", attached, shutdown);
 		qwz_log_publish();
 		return;
 	}
+	if (qwz_hal_gate != NULL && qwz_hal_gate->getWorkLoop() != NULL &&
+	    qwz_hal_gate->getWorkLoop()->onThread()) {
+		/* The teardown waits for the ioctl lock and for the firmware; the workloop thread must not sleep or spin. */
+		qwz_log("qwz: pm: sleep: asked on the workloop thread, which cannot wait for the teardown: leaving the chip as it is\n");
+		qwz_log_publish();
+		return;
+	}
+	if (wakeNeeded && !sc->fw_initialized) {
+		/* Wi-Fi was switched off, or this sleep already ran: the chip is down. */
+		qwz_log("qwz: pm: sleep: the chip is already powered down; nothing to do\n");
+		qwz_log_publish();
+		sleepBaseValid = false;
+		return;
+	}
 	ifp = &sc->sc_ic.ic_if;
+	if (!sleepBaseValid)
+		sleepFailBase = sc->sc_peer_del_fail;
+	sleepBaseValid = false;
 	qwz_log("qwz: pm: sleep: stopping the interface, fw_initialized %d\n", sc->fw_initialized);
 	qwz_log_publish();
+	/* As qwz_activate(DVACT_QUIESCE): the lock covers the stop and the power-down. */
 	rw_enter_write(&sc->ioctl_rwl);
+	{
+		int t, i, l;
+
+		/* Work queued between sleepQuiesce() and here is cut off by the stop. */
+		if (qwz_state_work(sc, &t, &i, &l) && (t || i))
+			qwz_log("qwz: pm: sleep: in-flight state work appeared after the quiesce (%d task(s), init task %d): stopping anyway\n", t, i);
+	}
 	ifp->if_flags &= ~IFF_UP;
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
-	rw_exit(&sc->ioctl_rwl);
+	nfail = sc->sc_peer_del_fail - sleepFailBase;
+	dirtyTeardown = !TAILQ_EMPTY(&sc->peers) || nfail != 0;
+	if (dirtyTeardown)
+		qwz_log("qwz: pm: sleep: DIRTY teardown: %d peer(s) still listed, %u peer delete failure(s) on the way down\n",
+		    sc->num_peers, nfail);
 	if (sc->fw_initialized) {
 		qwz_log("qwz: pm: sleep: firmware stop, MHI stop, MSI off, SoC reset (ath12k power down)\n");
 		qwz_log_publish();
 		qwz_core_deinit(sc);
 	}
+	rw_exit(&sc->ioctl_rwl);
 	saveConfig();
 	wakeNeeded = true;
+	bzero(&stall, sizeof(stall));	/* the next firmware starts a new data-stall episode */
 	qwz_log("qwz: pm: sleep: chip down in %llu ms; saved id %08x cmd %04x bar0 %08x:%08x msi %04x/%08x:%08x/%04x devctl %04x\n",
 	    qwz_pm_ms() - t0, saved.id, saved.cmd, saved.bar[1], saved.bar[0],
 	    saved.msiCtl, saved.msiHi, saved.msiLo, saved.msiData, saved.devCtl);
@@ -359,8 +468,140 @@ ItlQwz::wakeNeedsRecovery()
 void
 ItlQwz::wakeComplete(bool ok)
 {
-	if (ok)
-		wakeNeeded = false;
+	if (!ok) {
+		/* The firmware is gone either way: nothing recorded about the old one applies to the next try. */
+		sleepBaseValid = false;
+		busResetNext = false;
+		dirtyTeardown = false;
+		bzero(&stall, sizeof(stall));
+		return;
+	}
+	wakeNeeded = false;
+	bzero(&stall, sizeof(stall));	/* a new firmware: earlier evidence does not count */
+	if (dirtyTeardown) {
+		/* The data-stall watch is always on; this only notes that its trigger may follow. */
+		qwz_log("qwz: pm: wake: the teardown before sleep was dirty: a data-stall detection below is probably its result\n");
+		qwz_log_publish();
+		dirtyTeardown = false;
+	}
+}
+
+void
+ItlQwz::requestBusReset()
+{
+	busResetNext = true;
+}
+
+/*
+ * Data-stall watch, polled once a second by the controller's watchdog. After
+ * the build-3 sleep with a half-deleted peer the firmware associated again
+ * and again, management frames kept arriving, but not one data frame did (no
+ * EAPOL, so no 4-way handshake). Nothing a host driver can do repairs that
+ * short of restarting the firmware, so say so: true when the interface has
+ * spent QWZ_STALL_RUN_MS in RUN without one data frame while at least
+ * QWZ_STALL_MGMT_MIN management frames arrived (the firmware is alive, only
+ * its data path is dead). The RUN time is added up over consecutive
+ * associations: the AP gives up on a stalled handshake within seconds, so a
+ * single association may never last that long. Management frames count from
+ * the start of the episode, in RUN or not (the firmware seems to pass few
+ * beacons on while associated). One data frame, the first EAPOL message of a
+ * working link, ends the episode, and so does a minute without RUN (old
+ * evidence does not carry over to a later association). Five minutes in RUN
+ * with data seen count as a healthy link: the controller then forgets its
+ * earlier restarts.
+ */
+#define QWZ_STALL_RUN_MS	10000
+#define QWZ_STALL_MGMT_MIN	3
+#define QWZ_STALL_EPISODE_MS	60000
+#define QWZ_STALL_HEALTHY_MS	300000
+
+IOReturn
+ItlQwz::stallCheckGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller */
+	bool *stalled = (bool *)arg1;
+	bool *healthy = (bool *)arg2;
+	struct qwz_softc *sc = that->sc;
+	struct ieee80211com *ic;
+	uint64_t now = qwz_pm_ms();
+	uint32_t data, mgmt, dt;
+	bool inRun, wasRun;
+
+	*stalled = false;
+	*healthy = false;
+	if (sc == NULL || !that->attached || that->shutdown || that->wakeNeeded ||
+	    !sc->fw_initialized) {
+		bzero(&that->stall, sizeof(that->stall));
+		return kIOReturnSuccess;
+	}
+	ic = &sc->sc_ic;
+	data = sc->sc_probe_data_seen;
+	mgmt = sc->sc_probe_mgmt_seen;
+	if (!that->stall.valid) {
+		that->stall.valid = true;
+		that->stall.data = data;
+		that->stall.mgmt = mgmt;
+		that->stall.lastMs = now;
+		that->stall.lastRunMs = now;
+		return kIOReturnSuccess;
+	}
+	/* A late sample (the gate was busy) must not count seconds that were not RUN. */
+	dt = (uint32_t)MIN(now - that->stall.lastMs, 2000);
+	that->stall.lastMs = now;
+	wasRun = that->stall.inRun;
+	inRun = ic->ic_state == IEEE80211_S_RUN && (ic->ic_if.if_flags & IFF_RUNNING);
+	that->stall.inRun = inRun;
+	if (inRun && !wasRun)
+		that->stall.periodData = false;		/* a new association */
+	if (inRun)
+		that->stall.lastRunMs = now;
+	else if (now - that->stall.lastRunMs > QWZ_STALL_EPISODE_MS &&
+	    (that->stall.runMs != 0 || that->stall.mgmtIn != 0 || that->stall.logged)) {
+		/* A minute without RUN: whatever was counted before is stale. */
+		that->stall.runMs = 0;
+		that->stall.mgmtIn = 0;
+		that->stall.logged = false;
+	}
+	if (data != that->stall.data) {
+		/* A data frame: the data path works. */
+		that->stall.periodData = true;
+		that->stall.runMs = 0;
+		that->stall.mgmtIn = 0;
+		that->stall.logged = false;
+	} else
+		that->stall.mgmtIn += mgmt - that->stall.mgmt;
+	if (inRun && wasRun && !that->stall.periodData)
+		that->stall.runMs += dt;		/* RUN since the last sample too */
+	that->stall.data = data;
+	that->stall.mgmt = mgmt;
+	if (inRun && wasRun && that->stall.periodData)
+		that->stall.healthyMs += dt;
+	else if (!inRun || !that->stall.periodData)
+		that->stall.healthyMs = 0;
+	*healthy = that->stall.healthyMs >= QWZ_STALL_HEALTHY_MS;
+	if (!inRun || that->stall.periodData || that->stall.runMs < QWZ_STALL_RUN_MS ||
+	    that->stall.mgmtIn < QWZ_STALL_MGMT_MIN)
+		return kIOReturnSuccess;
+	*stalled = true;
+	if (!that->stall.logged) {
+		that->stall.logged = true;
+		qwz_log("qwz: pm: data-stall: %u ms in RUN without a data frame (data_seen %u), %u management frames meanwhile (mgmt_seen %u), dirty teardown at the last sleep %d\n",
+		    that->stall.runMs, data, that->stall.mgmtIn, mgmt, that->dirtyTeardown);
+		qwz_log_publish();
+	}
+	return kIOReturnSuccess;
+}
+
+bool
+ItlQwz::dataStalled(bool *healthy)
+{
+	bool stalled = false, ok = false;
+
+	if (attached && !shutdown && qwz_hal_gate != NULL)
+		qwz_hal_gate->runAction(stallCheckGated, this, &stalled, &ok);
+	if (healthy != NULL)
+		*healthy = ok;
+	return stalled;
 }
 
 IOReturn
@@ -374,9 +615,11 @@ ItlQwz::wakeHardware()
 	uint32_t lcap = 0;
 	UInt8 exp = 0, pm = 0;
 	bool haveExp = false, dlla = false;
+	bool forceSbr = busResetNext;	/* the data-stall restart asked for the stronger reset */
 	const char *step = "none (config already valid)";
 	int i;
 
+	busResetNext = false;
 	if (!attached || shutdown || pciDev == NULL)
 		return kIOReturnNotReady;
 	if (!saved.valid) {
@@ -447,14 +690,15 @@ ItlQwz::wakeHardware()
 			step = "retrain";
 		qwz_log_publish();
 	}
-	if (id == 0xffffffffu && br != NULL) {
+	if ((id == 0xffffffffu || forceSbr) && br != NULL) {
 		/* c. Secondary Bus Reset, only when this is the one device behind the port */
 		if (!soleDeviceBehind(bus)) {
 			qwz_log("qwz: pm: wake: SBR skipped: other devices behind the parent bridge\n");
 		} else {
 			uint16_t bc = br->configRead16(QWZ_PM_BRIDGE_CTL);
 
-			qwz_log("qwz: pm: wake: secondary bus reset on the parent bridge\n");
+			qwz_log("qwz: pm: wake: secondary bus reset on the parent bridge%s\n",
+			    id != 0xffffffffu ? " (requested, the device still answers)" : "");
 			qwz_log_publish();
 			br->configWrite16(QWZ_PM_BRIDGE_CTL, bc | QWZ_PM_BRIDGE_CTL_SBR);
 			IOSleep(2);		/* PCI_RESET_ASSERT 2 ms (>= 1 ms) */
@@ -590,6 +834,12 @@ ItlQwz::disableGated(OSObject *, void *arg0, void *, void *, void *)
 	struct _ifnet *ifp = &that->sc->sc_ic.ic_if;
 
 	rw_enter_write(&that->sc->ioctl_rwl);
+	{
+		int t, i, l;
+
+		if ((ifp->if_flags & IFF_RUNNING) && qwz_state_work(that->sc, &t, &i, &l) && (t || i))
+			qwz_log("qwz: pm: disable: stopping with state work in flight (%d task(s), init task %d)\n", t, i);
+	}
 	ifp->if_flags &= ~IFF_UP;
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);

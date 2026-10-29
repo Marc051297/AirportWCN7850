@@ -56,11 +56,26 @@ public:
      * wakeHardware(): bring the PCIe link and config space back (the caller
      * then re-enables the interface, which re-inits the firmware).
      * wakeComplete(): the caller reports the final outcome. Default: nothing.
+     *
+     * sleepQuiesce(): called before the interface goes down for sleep or
+     * Wi-Fi off; waits (bounded) until in-flight state work (a leave-network
+     * peer delete, key and block-ack tasks, an init) has finished, so the
+     * stop that follows tears the association down in order; it waits at most
+     * maxMs.
+     * dataStalled(): polled once a second; true when the interface sat in RUN
+     * for a while without one data frame while management frames kept coming.
+     * *healthy (if given) says data has flowed in RUN for a long time.
+     * requestBusReset(): the next wakeHardware() also does a secondary bus reset.
+     * firmwareUp(): the firmware is running (fw_initialized).
      */
+    virtual void sleepQuiesce(uint32_t maxMs) { (void)maxMs; }
+    virtual bool firmwareUp() { return false; }
     virtual void sleepHardware() {}
     virtual bool wakeNeedsRecovery() { return false; }
     virtual IOReturn wakeHardware() { return kIOReturnSuccess; }
     virtual void wakeComplete(bool ok) { (void)ok; }
+    virtual bool dataStalled(bool *healthy) { if (healthy) *healthy = false; return false; }
+    virtual void requestBusReset() {}
     
     virtual struct ieee80211com *get80211Controller() = 0;
     

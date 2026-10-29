@@ -43,6 +43,18 @@ enum
     kPowerStateCount
 };
 
+/* Who asked for a wake recovery; logged as "recovery run from ...". */
+enum
+{
+    kWakeViaPmThread = 0,
+    kWakeViaSetPower,
+    kWakeViaEnable,
+    kWakeViaRetry,
+    kWakeViaStall,
+    kWakeViaDeferred,
+    kWakeViaCount
+};
+
 #define kWatchDogTimerPeriod 1000
 #ifdef AIRPORT_WCL
 #define AIRPORT_LEGACY_OVERRIDE
@@ -118,7 +130,10 @@ public:
     
     static IOReturn tsleepHandler(OSObject* owner, void* arg0 = 0, void* arg1 = 0, void* arg2 = 0, void* arg3 = 0);
     static void eventHandler(struct ieee80211com *, int, void *);
-    IOReturn enableAdapter(IONetworkInterface *netif);
+    /* While a wake recovery is pending this runs it (PCI, then the full firmware init) instead of a bare enable. */
+    IOReturn enableAdapter(IONetworkInterface *netif, int via = kWakeViaEnable);
+    IOReturn enableAdapterNow(IONetworkInterface *netif);
+    static IOReturn enableAdapterGated(OSObject *owner, void *netif, void *via, void *, void *);
     void disableAdapter(IONetworkInterface *netif);
     bool initCCLogs();
     
@@ -264,10 +279,47 @@ public:
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
     thread_call_t wakeRetryCall;
+    thread_call_t stallCall;
     bool noWakeFix;
-    void wakeRecover(bool isRetry);
+    bool noRadioReset;  /* -qwznoradioreset: Wi-Fi off/on only stops and starts the interface */
+    bool noStallFix;  /* -qwznostallfix: no data-stall restart */
+    bool stallSbr;  /* -qwzstallsbr: the second data-stall restart also resets the PCIe link */
+    /*
+     * A chip power-down or wake recovery is running. Both sleep with the
+     * gate released (the firmware stop and load wait for interrupts), so a
+     * second thread must wait for the first, never run beside it.
+     */
+    bool chipBusy;
+    bool chipClaim(const char *who, uint32_t maxMs);
+    bool chipWait(const char *who, uint32_t maxMs);
+    void chipRelease();
+    const char *wakeLabel;  /* what the next recovery is called in the log */
+    bool chipIsDown;  /* a chip power-down completed and no recovery has started since */
+    bool chipUsed;  /* the interface was enabled since the firmware was last (re)started */
+    volatile bool sleepPending;  /* setPowerState(Off) arrived and the wake has not: no stall restarts */
+    bool pmStopping;  /* stop() began: the thread calls do nothing more */
+    uint32_t wakeRetryCount;  /* failed recoveries in this chain; the back-off index */
+    int wakeRetryVia;  /* what the queued thread call runs the recovery as */
+    bool chipDown(const char *why, const char *wakeName, uint32_t maxWaitMs, uint64_t budgetStartMs);
+    bool wakeRecover(int via);
+    bool wakeAllowed();
+    bool onWorkLoopThread();
+    bool pmReady();
+    void pmAcknowledge();
+    void quiescePM();
+    void scheduleWakeRetry(uint32_t ms, int via);
     void cancelWakeRetry();
     static IOReturn wakeRetryGated(OSObject *owner, void *, void *, void *, void *);
+    static IOReturn radioOffGated(OSObject *owner, void *, void *, void *, void *);
+    /* Data-stall restart: the watchdog polls, a thread call restarts the firmware. */
+    bool stallPending;  /* a restart is queued or running */
+    bool stallNoted;  /* why no restart is made was logged for this stall */
+    uint32_t stallRestarts;  /* restarts in this wake/boot window */
+    uint64_t stallLastMs;  /* when the last one began */
+    void checkDataStall();
+    void stallRestart();
+    void cancelStallRestart();
+    static IOReturn stallRestartGated(OSObject *owner, void *, void *, void *, void *);
     UInt32 pmPowerState;
     IOService *pmPolicyMaker;
     UInt8 pmPCICapPtr;

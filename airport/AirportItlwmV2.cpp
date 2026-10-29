@@ -49,6 +49,7 @@ void AirportItlwm::roleTimerFired(OSObject *owner, IOTimerEventSource *sender)
 
 void AirportItlwm::releaseAll()
 {
+    quiescePM();
 #ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
@@ -140,8 +141,11 @@ eventHandler(struct ieee80211com *ic, int msgCode, void *data)
 
 void AirportItlwm::watchdogAction(IOTimerEventSource *timer)
 {
+    if (fHalService == NULL || pmStopping)
+        return;
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     (*ifp->if_watchdog)(ifp);
+    checkDataStall();
 
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
 }
@@ -369,9 +373,23 @@ bool AirportItlwm::start(IOService *provider)
     fHalService->initWithController(this, _fWorkloop, _fCommandGate);
     fHalService->get80211Controller()->ic_event_handler = eventHandler;
 
+    qwz_log("qwz: pm: sleep/wake build 4r: quiesce before sleep, single-owner wake recovery, Wi-Fi off/on chip reset, data-stall restart\n");
     if (PE_parse_boot_argn("-qwznowakefix", &boot_value, sizeof(boot_value))) {
         noWakeFix = true;
         qwz_log("qwz: pm: -qwznowakefix: sleep/wake keeps the old interface-down/up handlers\n");
+        qwz_log("qwz: pm: -qwznowakefix: no wake ordering, Wi-Fi off/on reset or data-stall restart either\n");
+    }
+    if (PE_parse_boot_argn("-qwznoradioreset", &boot_value, sizeof(boot_value))) {
+        noRadioReset = true;
+        qwz_log("qwz: pm: -qwznoradioreset: Wi-Fi off/on only stops and starts the interface\n");
+    }
+    if (PE_parse_boot_argn("-qwznostallfix", &boot_value, sizeof(boot_value))) {
+        noStallFix = true;
+        qwz_log("qwz: pm: -qwznostallfix: no data-stall restart\n");
+    }
+    if (PE_parse_boot_argn("-qwzstallsbr", &boot_value, sizeof(boot_value))) {
+        stallSbr = true;
+        qwz_log("qwz: pm: -qwzstallsbr: the second data-stall restart also does a secondary bus reset\n");
     }
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
@@ -557,6 +575,7 @@ void AirportItlwm::systemWillShutdown(IOOptionBits specifier)
 void AirportItlwm::stop(IOService *provider)
 {
     qwz_logc("qwz: stop: enter\n");
+    quiescePM();
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     if (roleTimer) {
         roleTimer->cancelTimeout();
@@ -1185,19 +1204,35 @@ setPOWER(OSObject *object,
     IOLog("itlwm: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
     if (pd->num_radios > 0) {
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_RUNNING) != 0;
+        /* The requested state counts from here on, through the long teardown or recovery below. */
+        power_state = (pd->power_state[0]);
         if (pd->power_state[0] == 0) {
+            bool isUp = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) != 0;
+            /*
+             * Wi-Fi off is a real reset (stop the firmware, power the chip down
+             * as for system sleep), but only when there is something to reset:
+             * at boot with Wi-Fi left off the chip was never used, and the
+             * workloop thread cannot sleep for the teardown.
+             */
+            bool reset = !noWakeFix && !noRadioReset && (isUp || chipUsed) && !onWorkLoopThread();
+
             fHalService->get80211Controller()->ic_wcl_mac_reconfig = false;
             changePowerStateToPriv(kPowerStateOff);
-            if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
+            if (isUp)
                 net80211_ifstats(fHalService->get80211Controller());
+            if (reset) {
+                /*
+                 * If the power-state machine also runs setPowerStateOff for the
+                 * change above, its chip-down finds the chip down and does nothing.
+                 */
+                _fCommandGate->runAction(radioOffGated);
+            } else if (isUp)
                 disableAdapter(bsdInterface);
-            }
         } else {
             changePowerStateToPriv(kPowerStateOn);
             if (!isRunning)
-                enableAdapter(bsdInterface);
+                enableAdapter(bsdInterface, kWakeViaSetPower);
         }
-        power_state = (pd->power_state[0]);
     }
 
     return kIOReturnSuccess;
@@ -1207,6 +1242,7 @@ setPOWER(OSObject *object,
     IOLog("itlwm: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
     if (pd->num_radios > 0) {
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) != 0;
+        power_state = (pd->power_state[0]);
         if (pd->power_state[0] == 0) {
             changePowerStateToPriv(1);
             if (isRunning) {
@@ -1216,9 +1252,8 @@ setPOWER(OSObject *object,
         } else {
             changePowerStateToPriv(2);
             if (!isRunning)
-                enableAdapter(bsdInterface);
+                enableAdapter(bsdInterface, kWakeViaSetPower);
         }
-        power_state = (pd->power_state[0]);
     }
 
     return kIOReturnSuccess;
@@ -1250,7 +1285,35 @@ SInt32 AirportItlwm::apple80211SkywalkRequest(UInt request,int cmd,IO80211Skywal
     return kIOReturnUnsupported;
 }
 
-IOReturn AirportItlwm::enableAdapter(IONetworkInterface *netif)
+/* Indexed by kWakeVia*: the "recovery run from ..." log line. */
+static const char *const wakeViaName[] = {
+    "power-state thread", "setPOWER", "enable()", "retry", "data-stall restart", "deferred request"
+};
+static_assert(sizeof(wakeViaName) / sizeof(wakeViaName[0]) == kWakeViaCount,
+              "wakeViaName[] needs one entry per kWakeVia* value");
+
+/* How long a thread waits for a running chip transition (the gate is released meanwhile). */
+#define QWZ_CHIP_WAIT_MS	10000
+#define QWZ_PM_WAIT_MS		4000	/* the power-state thread: its acknowledge budget is 15 s / 20 s */
+#define QWZ_PM_QUIESCE_SKIP_MS	6000	/* no quiesce wait if the power-down thread already used this much */
+#define QWZ_QUIESCE_MS		3000
+
+static uint64_t pmNowMs(void)
+{
+    uint64_t t;
+
+    clock_get_uptime(&t);
+    absolutetime_to_nanoseconds(t, &t);
+    return t / 1000000ULL;
+}
+
+static uint32_t waitMsFor(int via)
+{
+    return via == kWakeViaPmThread ? QWZ_PM_WAIT_MS : QWZ_CHIP_WAIT_MS;
+}
+
+/* The bare enable: wakeRecover (and the build-2 handlers) end up here. */
+IOReturn AirportItlwm::enableAdapterNow(IONetworkInterface *netif)
 {
 #ifdef AIRPORT_WCL
     IOReturn status = fHalService->enable(netif);
@@ -1259,9 +1322,46 @@ IOReturn AirportItlwm::enableAdapter(IONetworkInterface *netif)
 #else
     fHalService->enable(netif);
 #endif
+    chipUsed = true;
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
     watchdogTimer->enable();
     return kIOReturnSuccess;
+}
+
+/*
+ * Every enable request lands here. After a chip power-down (sleep, Wi-Fi off,
+ * data-stall restart) a bare enable would run qwz_init on a chip nobody has
+ * brought back yet: airportd's setPOWER(1) did that before the power-state
+ * thread restored the PCI state. Whoever asks first runs the whole recovery.
+ */
+IOReturn AirportItlwm::enableAdapter(IONetworkInterface *netif, int via)
+{
+    if (noWakeFix)
+        return enableAdapterNow(netif);
+    return _fCommandGate->runAction(enableAdapterGated, netif, (void *)(intptr_t)via);
+}
+
+IOReturn AirportItlwm::enableAdapterGated(OSObject *owner, void *netif, void *via, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
+
+    if (self == NULL || self->fHalService == NULL)
+        return kIOReturnError;
+    if (!self->chipWait(wakeViaName[(intptr_t)via], waitMsFor((int)(intptr_t)via)))
+        return kIOReturnBusy;
+    if (self->fHalService->wakeNeedsRecovery()) {
+        /* The firmware init sleeps: the workloop thread cannot run it. A thread call will. */
+        if (self->onWorkLoopThread()) {
+            qwz_log("qwz: pm: wake: %s asked on the workloop thread: queueing the recovery on a thread that may sleep\n",
+                    wakeViaName[(intptr_t)via]);
+            qwz_log_publish();
+            self->scheduleWakeRetry(100, kWakeViaDeferred);
+            return kIOReturnBusy;
+        }
+        self->wakeRecover((int)(intptr_t)via);
+        return self->fHalService->wakeNeedsRecovery() ? kIOReturnNotReady : kIOReturnSuccess;
+    }
+    return self->enableAdapterNow((IONetworkInterface *)netif);
 }
 
 void AirportItlwm::disableAdapter(IONetworkInterface *netif)
@@ -1324,12 +1424,37 @@ static IOPMPowerState powerStateArray[kPowerStateCount] =
     {1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0}
 };
 
+/*
+ * Stop every thread call and wait for one that is running: the handlers use
+ * the gate and the HAL, which the teardown below frees. Idempotent.
+ */
+void AirportItlwm::quiescePM()
+{
+    thread_call_t calls[] = { wakeRetryCall, stallCall, powerOffThreadCall, powerOnThreadCall };
+
+    pmStopping = true;
+    if (watchdogTimer) {
+        watchdogTimer->cancelTimeout();
+        watchdogTimer->disable();
+    }
+    for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+        /* TRUE: it was queued and is cancelled now; FALSE: idle, or it ran to the end meanwhile */
+        if (calls[i] != NULL && thread_call_cancel_wait(calls[i]))
+            release();	/* the cancelled call's reference */
+    }
+    stallPending = false;
+}
+
 void AirportItlwm::unregistPM()
 {
-    cancelWakeRetry();
+    quiescePM();
     if (wakeRetryCall) {
         thread_call_free(wakeRetryCall);
         wakeRetryCall = NULL;
+    }
+    if (stallCall) {
+        thread_call_free(stallCall);
+        stallCall = NULL;
     }
     if (powerOffThreadCall) {
         thread_call_free(powerOffThreadCall);
@@ -1345,6 +1470,13 @@ IOReturn AirportItlwm::setPowerState(unsigned long powerStateOrdinal, IOService 
 {
     IOReturn result = IOPMAckImplied;
 
+    if (pmStopping)
+        return result;
+    /* Before the early return below: a queued stall restart must see the sleep coming, and the wake clears it. */
+    if (powerStateOrdinal == kPowerStateOff)
+        sleepPending = true;
+    else if (powerStateOrdinal == kPowerStateOn)
+        sleepPending = false;
     if (pmPowerState == powerStateOrdinal)
         return result;
     switch (powerStateOrdinal) {
@@ -1384,6 +1516,13 @@ static void handleSetPowerStateOff(thread_call_param_t param0,
 
     if (param1 == 0)
     {
+        if (!self->pmReady())
+        {
+            /* Stopping: no gate or HAL to work with, but the power change still wants its acknowledge. */
+            self->pmAcknowledge();
+            self->release();
+            return;
+        }
         self->getCommandGate()->runAction((IOCommandGate::Action)
                                            handleSetPowerStateOff,
                                            (void *) 1);
@@ -1402,6 +1541,12 @@ static void handleSetPowerStateOn(thread_call_param_t param0,
 
     if (param1 == 0)
     {
+        if (!self->pmReady())
+        {
+            self->pmAcknowledge();
+            self->release();
+            return;
+        }
         self->getCommandGate()->runAction((IOCommandGate::Action)
                                            handleSetPowerStateOn,
                                            (void *) 1);
@@ -1414,6 +1559,7 @@ static void handleSetPowerStateOn(thread_call_param_t param0,
 }
 
 static void handleWakeRetry(thread_call_param_t param0, thread_call_param_t param1);
+static void handleStallRestart(thread_call_param_t param0, thread_call_param_t param1);
 
 IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
 {
@@ -1427,6 +1573,8 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
                                             (thread_call_param_t)this);
     wakeRetryCall = thread_call_allocate((thread_call_func_t)handleWakeRetry,
                                          (thread_call_param_t)this);
+    stallCall = thread_call_allocate((thread_call_func_t)handleStallRestart,
+                                     (thread_call_param_t)this);
     powerOnThreadCall  = thread_call_allocate(
                                             (thread_call_func_t)handleSetPowerStateOn,
                                               (thread_call_param_t)this);
@@ -1436,54 +1584,252 @@ IOReturn AirportItlwm::registerWithPolicyMaker(IOService *policyMaker)
     return ret;
 }
 
+bool AirportItlwm::pmReady()
+{
+    return !pmStopping && fHalService != NULL && getCommandGate() != NULL;
+}
+
+void AirportItlwm::pmAcknowledge()
+{
+    if (pmPolicyMaker != NULL)
+        pmPolicyMaker->acknowledgeSetPowerState();
+}
+
+bool AirportItlwm::onWorkLoopThread()
+{
+    IOWorkLoop *wl = _fCommandGate != NULL ? _fCommandGate->getWorkLoop() : NULL;
+
+    return wl != NULL && wl->onThread();
+}
+
+/* A recovery may run: the system is awake and Wi-Fi is (or, without the radio reset, need not be) on. */
+bool AirportItlwm::wakeAllowed()
+{
+    return !pmStopping && !sleepPending && pmPowerState == kPowerStateOn &&
+        (power_state || noRadioReset);
+}
+
+/*
+ * The acknowledge budgets are 15 s (off) and 20 s (on); the power-state thread
+ * therefore waits at most QWZ_PM_WAIT_MS for a transition another thread is
+ * running, and skips the quiesce wait if that wait used most of its time.
+ * The acknowledge happens exactly once on every path, after the work.
+ */
 void AirportItlwm::setPowerStateOff()
 {
+    uint64_t start = pmNowMs();
+
     pmPowerState = kPowerStateOff;
     if (noWakeFix) {
         disableAdapter(bsdInterface);
-        pmPolicyMaker->acknowledgeSetPowerState();
+        pmAcknowledge();
         return;
     }
     cancelWakeRetry();
-    qwz_log("qwz: pm: ==== system sleep: interface down, chip power-down ====\n");
-    qwz_log_publish();
-    disableAdapter(bsdInterface);
-    fHalService->sleepHardware();
-    pmPolicyMaker->acknowledgeSetPowerState();
+    cancelStallRestart();
+    stallRestarts = 0;		/* a new wake/boot window */
+    stallNoted = false;
+    wakeRetryCount = 0;
+    if (!chipDown("system sleep", "system wake", QWZ_PM_WAIT_MS, start)) {
+        qwz_log("qwz: pm: system sleep: the chip was not powered down by this thread (see above); acknowledging anyway\n");
+        qwz_log_publish();
+    }
+    pmAcknowledge();
 }
 
 void AirportItlwm::setPowerStateOn()
 {
     pmPowerState = kPowerStateOn;
-    if (noWakeFix || !fHalService->wakeNeedsRecovery()) {
-        enableAdapter(bsdInterface);
-        pmPolicyMaker->acknowledgeSetPowerState();
+    if (noWakeFix) {
+        enableAdapterNow(bsdInterface);
+        pmAcknowledge();
         return;
     }
-    wakeRecover(false);
-    pmPolicyMaker->acknowledgeSetPowerState();
+    if (fHalService->wakeNeedsRecovery()) {
+        if (!power_state && !noRadioReset)
+            qwz_log("qwz: pm: wake: Wi-Fi is off: the chip stays down until it is switched on\n");
+        else if (!wakeRecover(kWakeViaPmThread)) {
+            /* Another thread owns the chip and may fail or be cut off: make sure someone looks again. */
+            qwz_log("qwz: pm: wake: the chip is busy with another transition: a recovery check is queued\n");
+            scheduleWakeRetry(5000, kWakeViaDeferred);
+        }
+    } else if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_RUNNING) {
+        /* airportd's setPOWER(1) got here first and recovered the chip. */
+        qwz_log("qwz: pm: wake: already recovered; the power-state thread only acknowledges\n");
+    } else
+        enableAdapter(bsdInterface, kWakeViaPmThread);
+    qwz_log_publish();
+    pmAcknowledge();
+}
+
+/*
+ * Wait, with the gate released, until no chip power transition is running;
+ * false if that took longer than maxMs, or if this is the workloop thread
+ * (which must stay free for the interrupts the other thread is waiting for).
+ */
+bool AirportItlwm::chipWait(const char *who, uint32_t maxMs)
+{
+    uint64_t deadline;
+
+    if (!chipBusy)
+        return true;
+    if (onWorkLoopThread()) {
+        qwz_log("qwz: pm: %s: a chip power transition is running and this is the workloop thread: not waiting\n", who);
+        return false;
+    }
+    qwz_log("qwz: pm: %s: a chip power transition is running; waiting up to %u ms for it\n", who, (unsigned)maxMs);
+    qwz_log_publish();
+    clock_interval_to_deadline(maxMs, NSEC_PER_MSEC, &deadline);
+    while (chipBusy) {
+        if (_fCommandGate->commandSleep(&chipBusy, deadline, THREAD_UNINT) == kIOReturnTimeout) {
+            qwz_log("qwz: pm: %s: gave up waiting for the running chip power transition\n", who);
+            qwz_log_publish();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AirportItlwm::chipClaim(const char *who, uint32_t maxMs)
+{
+    if (!chipWait(who, maxMs))
+        return false;
+    chipBusy = true;
+    return true;
+}
+
+void AirportItlwm::chipRelease()
+{
+    chipBusy = false;
+    _fCommandGate->commandWakeup(&chipBusy);
+}
+
+/*
+ * Interface down and chip power-down: what system sleep does (stop the
+ * association in order, firmware stop, MHI stop, SoC reset, save the PCI
+ * config). Wi-Fi off and the data-stall restart use it too, so each of them
+ * is a real reset. Runs holding the command gate. Returns false when it did
+ * not own the chip (another transition still running, or the workloop thread):
+ * the hardware is then untouched. A chip that is already down (Wi-Fi off,
+ * then sleep) is left alone, whoever got there first. budgetStartMs is the
+ * start of a time-limited caller (the power-state thread), 0 for none.
+ */
+bool AirportItlwm::chipDown(const char *why, const char *wakeName, uint32_t maxWaitMs, uint64_t budgetStartMs)
+{
+    if (onWorkLoopThread()) {
+        qwz_log("qwz: pm: %s: asked on the workloop thread, which cannot sleep for the teardown: chip left as it is\n", why);
+        qwz_log_publish();
+        return false;
+    }
+    if (!chipClaim(why, maxWaitMs)) {
+        qwz_log("qwz: pm: %s: another chip transition is still running: the hardware is not touched\n", why);
+        qwz_log_publish();
+        return false;
+    }
+    if (chipIsDown && fHalService->wakeNeedsRecovery() && !fHalService->firmwareUp()) {
+        qwz_log("qwz: pm: %s: the chip is already powered down\n", why);
+        qwz_log_publish();
+    } else {
+        wakeLabel = wakeName;
+        qwz_log("qwz: pm: ==== %s: interface down, chip power-down ====\n", why);
+        qwz_log_publish();
+        if (budgetStartMs != 0 && pmNowMs() - budgetStartMs > QWZ_PM_QUIESCE_SKIP_MS) {
+            qwz_log("qwz: pm: %s: %llu ms of the acknowledge budget are gone: not waiting for in-flight state work\n",
+                    why, pmNowMs() - budgetStartMs);
+            qwz_log_publish();
+        } else
+            fHalService->sleepQuiesce(QWZ_QUIESCE_MS);
+        disableAdapter(bsdInterface);
+        fHalService->sleepHardware();
+        chipIsDown = fHalService->wakeNeedsRecovery();
+        if (chipIsDown)
+            chipUsed = false;
+    }
+    chipRelease();
+    return true;
+}
+
+IOReturn AirportItlwm::radioOffGated(OSObject *owner, void *, void *, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
+
+    if (self == NULL || self->fHalService == NULL)
+        return kIOReturnError;
+    self->cancelWakeRetry();
+    self->cancelStallRestart();
+    self->stallRestarts = 0;
+    self->stallNoted = false;
+    self->wakeRetryCount = 0;
+    if (!self->chipDown("Wi-Fi off", "Wi-Fi on", QWZ_CHIP_WAIT_MS, 0)) {
+        qwz_log("qwz: pm: Wi-Fi off: the chip reset did not run (see above); the interface is stopped only\n");
+        qwz_log_publish();
+        if (!self->onWorkLoopThread())
+            self->disableAdapter(self->bsdInterface);
+    }
+    return kIOReturnSuccess;
 }
 
 /*
  * Wake after a chip power-down: PCIe link and config recovery, then the
  * interface enable, whose qwz_init does the full firmware init (the firmware
  * is gone: fw_initialized was cleared at sleep). Runs holding the command gate.
- * One delayed retry on failure, never more.
+ * A failure queues a retry with back-off (wakeRetryNext).
+ *
+ * Several threads can ask for this at once after a wake (airportd's setPOWER,
+ * the power-state thread): the first runs it, the others wait for it (qwz_init
+ * sleeps with the gate released) and find nothing left to do, so the PCI
+ * restore never runs beside a firmware boot and the init runs once.
+ * Returns false if the chip could not be claimed (nothing was done).
  */
-void AirportItlwm::wakeRecover(bool isRetry)
+#define QWZ_WAKE_RETRY_MAX	12
+
+static void wakeRetryNext(AirportItlwm *self)
+{
+    /* 5 s, 30 s, 60 s, then every 5 minutes; 12 tries in all (about 50 minutes) */
+    static const uint32_t delaysSec[] = { 5, 30, 60 };
+    uint32_t n = self->wakeRetryCount, sec;
+
+    if (n >= QWZ_WAKE_RETRY_MAX) {
+        if (n == QWZ_WAKE_RETRY_MAX) {
+            self->wakeRetryCount++;
+            qwz_log("qwz: pm: wake: GIVING UP after %u failed recoveries: the chip stays down; toggle Wi-Fi or sleep and wake\n", n);
+            qwz_log_publish();
+        }
+        return;
+    }
+    sec = n < sizeof(delaysSec) / sizeof(delaysSec[0]) ? delaysSec[n] : 300;
+    self->wakeRetryCount = n + 1;
+    qwz_log("qwz: pm: wake: recovery failed; retry %u of %u in %u s\n", n + 1, QWZ_WAKE_RETRY_MAX, sec);
+    qwz_log_publish();
+    self->scheduleWakeRetry(sec * 1000, kWakeViaRetry);
+}
+
+bool AirportItlwm::wakeRecover(int via)
 {
     uint64_t t0, t1;
     bool ok = false;
+    bool isRetry = via == kWakeViaRetry;
     IOReturn r;
 
+    if (!chipClaim(wakeViaName[via], waitMsFor(via)))
+        return false;
+    if (!fHalService->wakeNeedsRecovery()) {
+        qwz_log("qwz: pm: wake: already recovered; %s has nothing left to do\n", wakeViaName[via]);
+        qwz_log_publish();
+        chipRelease();
+        return true;
+    }
+    chipIsDown = false;
     clock_get_uptime(&t0);
-    qwz_log("qwz: pm: ==== system wake%s: recovering the Wi-Fi chip ====\n", isRetry ? " (retry)" : "");
+    qwz_log("qwz: pm: ==== %s%s: recovering the Wi-Fi chip ====\n", wakeLabel ? wakeLabel : "system wake",
+            isRetry ? " (retry)" : "");
+    qwz_log("qwz: pm: wake: recovery run from %s\n", wakeViaName[via]);
     qwz_log_publish();
     r = fHalService->wakeHardware();
     if (r == kIOReturnSuccess) {
         qwz_log("qwz: pm: wake: firmware re-init (enable interface)\n");
         qwz_log_publish();
-        r = enableAdapter(bsdInterface);
+        r = enableAdapterNow(bsdInterface);
         if (r == kIOReturnSuccess) {
             ok = true;
         } else {
@@ -1497,30 +1843,45 @@ void AirportItlwm::wakeRecover(bool isRetry)
     absolutetime_to_nanoseconds(t1 - t0, &t1);
     qwz_log("qwz: pm: wake: %s, total wake recovery %llu ms\n", ok ? "SUCCESS" : "FAILED", t1 / 1000000ULL);
     qwz_log_publish();
-    if (!ok && !isRetry && wakeRetryCall != NULL && pmPowerState == kPowerStateOn) {
-        uint64_t deadline;
-
-        qwz_log("qwz: pm: wake: one retry in 5 s\n");
-        qwz_log_publish();
-        clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
-        retain();
-        if (thread_call_enter_delayed(wakeRetryCall, deadline))
-            release();	/* was already queued: that one holds a reference */
+    if (ok)
+        wakeRetryCount = 0;
+    chipRelease();
+    if (!ok) {
+        if (wakeAllowed())
+            wakeRetryNext(this);
+        else {
+            qwz_log("qwz: pm: wake: no retry: the system is going to sleep, or Wi-Fi is off; the next wake or Wi-Fi on recovers\n");
+            qwz_log_publish();
+        }
     }
+    return true;
+}
+
+void AirportItlwm::scheduleWakeRetry(uint32_t ms, int via)
+{
+    uint64_t deadline;
+
+    if (wakeRetryCall == NULL || pmStopping)
+        return;
+    wakeRetryVia = via;
+    clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+    retain();
+    if (thread_call_enter_delayed(wakeRetryCall, deadline))
+        release();	/* was already queued: that one holds a reference */
 }
 
 IOReturn AirportItlwm::wakeRetryGated(OSObject *owner, void *, void *, void *, void *)
 {
     AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
 
-    if (self == NULL || self->fHalService == NULL)
+    if (self == NULL || self->fHalService == NULL || self->pmStopping)
         return kIOReturnError;
-    if (self->pmPowerState != kPowerStateOn || !self->fHalService->wakeNeedsRecovery()) {
+    if (!self->wakeAllowed() || !self->fHalService->wakeNeedsRecovery()) {
         qwz_log("qwz: pm: wake retry: not needed any more\n");
         qwz_log_publish();
         return kIOReturnSuccess;
     }
-    self->wakeRecover(true);
+    self->wakeRecover(self->wakeRetryVia);
     return kIOReturnSuccess;
 }
 
@@ -1528,7 +1889,8 @@ static void handleWakeRetry(thread_call_param_t param0, thread_call_param_t)
 {
     AirportItlwm *self = (AirportItlwm *) param0;
 
-    self->getCommandGate()->runAction(AirportItlwm::wakeRetryGated);
+    if (self->pmReady())
+        self->getCommandGate()->runAction(AirportItlwm::wakeRetryGated);
     self->release();
 }
 
@@ -1536,6 +1898,123 @@ void AirportItlwm::cancelWakeRetry()
 {
     if (wakeRetryCall != NULL && thread_call_cancel(wakeRetryCall))
         release();	/* the cancelled call's reference */
+}
+
+/*
+ * Data-stall restart. ItlQwz::dataStalled() reports an interface that sat in
+ * RUN without one data frame while management frames kept coming: the
+ * firmware is up but its data path is dead (seen after a sleep that left a
+ * half-deleted peer). The cure is what a wake does, a full firmware restart.
+ * The watchdog (once a second, no gate) only polls; a thread call does the
+ * work holding the gate. At most twice per wake/boot window, 60 s apart; with
+ * -qwzstallsbr the second one also resets the PCIe link. A window ends at
+ * sleep, Wi-Fi off, or after five minutes of a healthy link.
+ */
+#define QWZ_STALL_MAX_RESTARTS	2
+#define QWZ_STALL_BACKOFF_MS	60000
+
+void AirportItlwm::checkDataStall()
+{
+    uint64_t now;
+    bool healthy = false, stalled;
+
+    if (noWakeFix || noStallFix || stallCall == NULL || pmStopping || sleepPending ||
+        pmPowerState != kPowerStateOn || !power_state || chipBusy)
+        return;
+    stalled = fHalService->dataStalled(&healthy);
+    if (healthy && (stallRestarts != 0 || stallNoted)) {
+        qwz_log("qwz: pm: data-stall: the link has been healthy for a while: the restart count (%u) is reset\n", stallRestarts);
+        qwz_log_publish();
+        stallRestarts = 0;
+        stallNoted = false;
+    }
+    if (!stalled || stallPending)
+        return;
+    now = pmNowMs();
+    if (stallRestarts >= QWZ_STALL_MAX_RESTARTS) {
+        if (!stallNoted) {
+            stallNoted = true;
+            qwz_log("qwz: pm: data-stall: still stalled after %u restarts in this wake/boot window: no more restarts (toggle Wi-Fi, or sleep and wake)\n",
+                    stallRestarts);
+            qwz_log_publish();
+        }
+        return;
+    }
+    if (stallRestarts > 0 && now - stallLastMs < QWZ_STALL_BACKOFF_MS) {
+        if (!stallNoted) {
+            stallNoted = true;
+            qwz_log("qwz: pm: data-stall: back-off: the next restart is allowed in %llu s\n",
+                    (QWZ_STALL_BACKOFF_MS - (now - stallLastMs)) / 1000ULL);
+            qwz_log_publish();
+        }
+        return;
+    }
+    stallPending = true;
+    retain();
+    if (thread_call_enter(stallCall))
+        release();	/* was already queued: that one holds a reference */
+}
+
+void AirportItlwm::stallRestart()
+{
+    if (noStallFix || pmStopping || sleepPending || pmPowerState != kPowerStateOn || !power_state || chipBusy ||
+        !fHalService->dataStalled(NULL)) {
+        qwz_log("qwz: pm: data-stall: gone, or the power state changed, before the restart ran: leaving it\n");
+        qwz_log_publish();
+        return;
+    }
+    stallRestarts++;
+    stallLastMs = pmNowMs();
+    stallNoted = false;
+    qwz_log("qwz: pm: data-stall: restarting the firmware (restart %u of %u in this wake/boot window)\n",
+            stallRestarts, QWZ_STALL_MAX_RESTARTS);
+    if (stallSbr && stallRestarts > 1) {
+        qwz_log("qwz: pm: data-stall: this restart also resets the PCIe link (-qwzstallsbr)\n");
+        fHalService->requestBusReset();
+    }
+    qwz_log_publish();
+    if (!chipDown("data-stall restart", "data-stall restart", QWZ_CHIP_WAIT_MS, 0))
+        return;
+    /* chipDown sleeps with the gate released: a sleep or Wi-Fi off may have arrived meanwhile. */
+    if (!wakeAllowed()) {
+        qwz_log("qwz: pm: data-stall: a sleep or Wi-Fi off arrived during the power-down: the chip stays down for the wake / Wi-Fi on\n");
+        qwz_log_publish();
+        return;
+    }
+    wakeRecover(kWakeViaStall);
+}
+
+IOReturn AirportItlwm::stallRestartGated(OSObject *owner, void *, void *, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
+
+    if (self == NULL || self->fHalService == NULL || self->pmStopping) {
+        if (self != NULL)
+            self->stallPending = false;
+        return kIOReturnError;
+    }
+    self->stallRestart();
+    self->stallPending = false;
+    return kIOReturnSuccess;
+}
+
+static void handleStallRestart(thread_call_param_t param0, thread_call_param_t)
+{
+    AirportItlwm *self = (AirportItlwm *) param0;
+
+    if (self->pmReady())
+        self->getCommandGate()->runAction(AirportItlwm::stallRestartGated);
+    else
+        self->stallPending = false;
+    self->release();
+}
+
+void AirportItlwm::cancelStallRestart()
+{
+    if (stallCall != NULL && thread_call_cancel(stallCall)) {
+        stallPending = false;
+        release();	/* the cancelled call's reference */
+    }
 }
 
 /*
