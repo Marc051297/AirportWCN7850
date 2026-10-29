@@ -452,6 +452,28 @@ full_init:
 	sc->qrtr_server.node = QRTR_NODE_BCAST;
 	set_bit(ATH12K_FLAG_QMI_FAIL, sc->sc_flags);
 
+#ifdef __APPLE__
+	/*
+	 * A firmware restart (wake, Wi-Fi on, a retry): upstream runs
+	 * qwz_hal_srng_init (DVACT_RESUME) before this, and ath12k
+	 * re-creates the HAL on every restart. Without it the ring-pointer
+	 * words shared with the chip keep the previous firmware's values;
+	 * they live in host RAM, so sleep does not clear them and only a
+	 * reboot did. Seen as no data frame after a wake, and as WMI
+	 * commands that never return credits ('tx credits timeout').
+	 */
+	if (sc->fw_started) {
+		error = qwz_hal_srng_init(sc);
+		if (error) {
+			printf("%s: could not reset the hal rings: %d\n",
+			    sc->sc_dev.dv_xname, error);
+			splx(s);
+			return error;
+		}
+		qwz_log("qwz: pm: hal ring pointers reset for the restart\n");
+	}
+	sc->fw_started = 1;
+#endif
 	error = qwz_core_init(sc);
 	if (error) {
 		splx(s);
@@ -6697,6 +6719,14 @@ qwz_qmi_mem_seg_send(struct qwz_softc *sc)
 			DPRINTF("%s: allocated %zu bytes of DMA memory for "
 			    "firmware\n", sc->sc_dev.dv_xname, total_size);
 	}
+#ifdef __APPLE__
+	else {
+		/* A restart reuses the block: hand it over zeroed, as at the first boot. */
+		memset(QWZ_DMA_KVA(sc->fwmem), 0, QWZ_DMA_LEN(sc->fwmem));
+		qwz_log("qwz: pm: firmware host memory (%zu bytes) zeroed for the restart\n",
+		    (size_t)QWZ_DMA_LEN(sc->fwmem));
+	}
+#endif
 
 	/* Chunk DMA memory block into segments as requested by firmware. */
 	req->mem_seg_len = htole32(mem_seg_len);

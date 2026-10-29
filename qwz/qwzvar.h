@@ -2040,6 +2040,7 @@ struct qwz_softc {
 
 	int			attached;
 	int			fw_initialized;
+	int			fw_started;	/* macOS: a firmware ran since the last qwz_hal_srng_init */
 	int			ce_initialized;
 	int			powered;
 	struct {

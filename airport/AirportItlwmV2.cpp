@@ -373,7 +373,7 @@ bool AirportItlwm::start(IOService *provider)
     fHalService->initWithController(this, _fWorkloop, _fCommandGate);
     fHalService->get80211Controller()->ic_event_handler = eventHandler;
 
-    qwz_log("qwz: pm: sleep/wake build 4r: quiesce before sleep, single-owner wake recovery, Wi-Fi off/on chip reset, data-stall restart\n");
+    qwz_log("qwz: pm: sleep/wake build 5: hal ring + firmware memory reset on restart, setPOWER waits for the system wake, quiesce, single-owner recovery, Wi-Fi off/on reset, data-stall restart\n");
     if (PE_parse_boot_argn("-qwznowakefix", &boot_value, sizeof(boot_value))) {
         noWakeFix = true;
         qwz_log("qwz: pm: -qwznowakefix: sleep/wake keeps the old interface-down/up handlers\n");
@@ -1350,6 +1350,18 @@ IOReturn AirportItlwm::enableAdapterGated(OSObject *owner, void *netif, void *vi
     if (!self->chipWait(wakeViaName[(intptr_t)via], waitMsFor((int)(intptr_t)via)))
         return kIOReturnBusy;
     if (self->fHalService->wakeNeedsRecovery()) {
+        if ((intptr_t)via == kWakeViaSetPower &&
+            (self->pmPowerState != kPowerStateOn || self->sleepPending)) {
+            /*
+             * airportd's setPOWER(1) can arrive before the system wake reaches
+             * this driver, with the bridge above the chip not restored yet
+             * (brctl 0000): the firmware boot then failed with 'link down
+             * error during global reset'. setPowerStateOn runs the recovery.
+             */
+            qwz_log("qwz: pm: wake: setPOWER(1) came before the system wake reached the driver: the power-state thread recovers\n");
+            qwz_log_publish();
+            return kIOReturnNotReady;
+        }
         /* The firmware init sleeps: the workloop thread cannot run it. A thread call will. */
         if (self->onWorkLoopThread()) {
             qwz_log("qwz: pm: wake: %s asked on the workloop thread: queueing the recovery on a thread that may sleep\n",
